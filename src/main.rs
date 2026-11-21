@@ -15,7 +15,6 @@ const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const LATE: i64 = DAY;
-const LINK_BIT: u64 = 1 << 63;
 const CHUNK: usize = 4 << 20;
 const SHARDS: usize = 256;
 
@@ -37,44 +36,6 @@ fn hash(b: &[u8]) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     h.write(b);
     fmix(h.finish() ^ (b.len() as u64).wrapping_mul(0x9e3779b97f4a7c15))
-}
-
-/// Exact 16-byte form of an ID: big-endian bytes plus the length in the last byte when
-/// the ID is at most 15 bytes long, otherwise a 120-bit hash with 0xFF in the last byte.
-type P = (u64, u64);
-
-#[inline]
-fn pack(b: &[u8]) -> P {
-    if b.len() <= 15 {
-        let mut a = [0u8; 16];
-        a[..b.len()].copy_from_slice(b);
-        a[15] = b.len() as u8;
-        (u64::from_be_bytes(a[..8].try_into().unwrap()), u64::from_be_bytes(a[8..].try_into().unwrap()))
-    } else {
-        use std::hash::Hasher;
-        let mut h = rustc_hash::FxHasher::default();
-        h.write(&[0x5a, 0xa5]);
-        h.write(b);
-        let h2 = fmix(h.finish() ^ 0x2545f4914f6cdd1d);
-        (hash(b), (h2 << 8) | 0xFF)
-    }
-}
-
-#[inline]
-fn is_short(p: P) -> bool {
-    (p.1 & 0xFF) <= 15
-}
-
-fn unpack(p: P) -> Vec<u8> {
-    let mut a = [0u8; 16];
-    a[..8].copy_from_slice(&p.0.to_be_bytes());
-    a[8..].copy_from_slice(&p.1.to_be_bytes());
-    a[..a[15] as usize].to_vec()
-}
-
-#[inline]
-fn phash(p: P) -> u64 {
-    fmix(p.0 ^ fmix(p.1 ^ 0x9e3779b97f4a7c15))
 }
 
 fn log(t0: Instant, msg: &str) {
@@ -197,7 +158,21 @@ fn fields<const N: usize>(line: S, out: &mut [S; N]) -> bool {
 /// Bitmasks of '\n', ',' and '"' for 64 bytes starting at p (SSE2, always on x86_64).
 #[inline(always)]
 fn classify(block: &[u8; 64]) -> (u64, u64, u64) {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let cm = _mm256_set1_epi8(b',' as i8);
+        let qt = _mm256_set1_epi8(b'"' as i8);
+        let v0 = _mm256_loadu_si256(block.as_ptr() as *const __m256i);
+        let v1 = _mm256_loadu_si256(block.as_ptr().add(32) as *const __m256i);
+        let m = |a: __m256i, b: __m256i| -> u64 {
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, a)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, b)) as u32 as u64) << 32)
+        };
+        return (m(nl, nl), m(cm, cm), m(qt, qt));
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     unsafe {
         use std::arch::x86_64::*;
         let nl = _mm_set1_epi8(b'\n' as i8);
@@ -213,6 +188,7 @@ fn classify(block: &[u8; 64]) -> (u64, u64, u64) {
         (a, b, c)
     }
     #[cfg(not(target_arch = "x86_64"))]
+    #[allow(unreachable_code)]
     {
         let (mut a, mut b, mut c) = (0u64, 0u64, 0u64);
         for (i, &x) in block.iter().enumerate() {
@@ -509,26 +485,109 @@ fn small_csv(path: &Path) -> Vec<(S, S)> {
     v
 }
 
+// ---------------------------------------------------------------- id codes
+
+/// Top bit set: the ID did not fit the exact code and is a hash (original kept in `Side`).
+const HBIT: u64 = 1 << 63;
+
+static CODE: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = 1 + i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 26 {
+        t[b'a' as usize + i] = 11 + i as u8;
+        i += 1;
+    }
+    t
+};
+
+const POW37: [u64; 13] = {
+    let mut t = [1u64; 13];
+    let mut i = 1;
+    while i < 13 {
+        t[i] = t[i - 1] * 37;
+        i += 1;
+    }
+    t
+};
+
+/// Exact, order-preserving 63-bit code of an ID made of 1 to 12 characters from [0-9a-z]:
+/// base-37 digits, left aligned, 0 = past the end. So for two such IDs, comparing codes is
+/// comparing bytes. Any other ID gets a 64-bit hash with HBIT set.
+#[inline]
+fn enc(s: &[u8]) -> u64 {
+    let n = s.len();
+    if n >= 1 && n <= 12 {
+        let mut v = 0u64;
+        let mut ok = true;
+        for &c in s {
+            let d = CODE[c as usize];
+            ok &= d != 0;
+            v = v * 37 + d as u64;
+        }
+        if ok {
+            return v * POW37[12 - n];
+        }
+    }
+    hash(s) | HBIT
+}
+
+fn dec(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    for i in (0..12).rev() {
+        let d = (v / POW37[i]) as u8;
+        v %= POW37[i];
+        if d == 0 {
+            break;
+        }
+        out.push(if d <= 10 { b'0' + d - 1 } else { b'a' + d - 11 });
+    }
+    out
+}
+
+/// Original text of hashed IDs.
+type Side = hashbrown::HashMap<u64, S>;
+
+fn id_bytes(code: u64, side: &Side) -> Vec<u8> {
+    if code & HBIT == 0 {
+        dec(code)
+    } else {
+        side[&code].to_vec()
+    }
+}
+
+#[inline]
+fn cmp_ids(a: u64, b: u64, side: &Side) -> std::cmp::Ordering {
+    if (a | b) & HBIT == 0 {
+        a.cmp(&b)
+    } else {
+        id_bytes(a, side).cmp(&id_bytes(b, side))
+    }
+}
+
+#[inline]
+fn shard(code: u64) -> usize {
+    (fmix(code) >> 56) as usize
+}
+
 // ---------------------------------------------------------------- linked IDs
 
+/// user code -> person key, where the key is the code of the person's name (the byte-wise
+/// smallest of its IDs). IDs in no link line are their own person, so their key is their code.
 struct People {
-    shards: Vec<HashTable<(P, u64)>>, // packed id -> person key
-    names: Vec<S>,                       // by root id: smallest member id
+    shards: Vec<HashTable<(u64, u64)>>,
 }
 
 impl People {
-    /// Person key for a user ID: LINK_BIT | root for linked IDs, a hash of the ID otherwise.
     #[inline]
-    #[allow(dead_code)]
-    fn key(&self, user: S) -> u64 {
-        let p = pack(user);
-        self.key_packed(p, phash(p))
-    }
-    #[inline]
-    fn key_packed(&self, p: P, h: u64) -> u64 {
-        match self.shards[(h >> 56) as usize].find(h, |e| e.0 == p) {
+    fn key(&self, code: u64) -> u64 {
+        match self.shards[shard(code)].find(fmix(code), |e| e.0 == code) {
             Some(e) => e.1,
-            None => h & !LINK_BIT,
+            None => code,
         }
     }
 }
@@ -542,76 +601,88 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-fn build_people(dir: &Path, t0: Instant) -> People {
+fn parse_links(dir: &Path, threads: usize) -> (Vec<Vec<(u64, u64)>>, Vec<(u64, S)>) {
     let ch = chunks(dir);
-    // parse
-    let pairs: Vec<Vec<(u64, S, u64, S, P, P)>> = ch
-        .par_iter()
-        .map(|&c| {
-            let mut v = Vec::new();
-            scan::<2>(c, |f| {
+    let res: Vec<(Vec<(u64, u64)>, Vec<(u64, S)>)> = run_par(
+        ch.len(),
+        threads,
+        || (Vec::new(), Vec::new()),
+        |(v, side), ci| {
+            scan::<2>(ch[ci], |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
-                    let (pa, pb) = (pack(f[0]), pack(f[1]));
-                    v.push((phash(pa), f[0], phash(pb), f[1], pa, pb));
+                    let (a, b) = (enc(f[0]), enc(f[1]));
+                    if a & HBIT != 0 {
+                        side.push((a, f[0]));
+                    }
+                    if b & HBIT != 0 {
+                        side.push((b, f[1]));
+                    }
+                    v.push((a, b));
                 }
             });
-            v
-        })
-        .collect();
-    // shard endpoints
-    let per_shard: Vec<Vec<Vec<(u64, S, P)>>> = pairs
+        },
+    );
+    let mut side = Vec::new();
+    let mut pairs = Vec::new();
+    for (p, s) in res {
+        pairs.push(p);
+        side.extend(s);
+    }
+    (pairs, side)
+}
+
+fn build_people(pairs: Vec<Vec<(u64, u64)>>, side: &Side, threads: usize) -> People {
+    // intern endpoints shard by shard
+    let _ = threads;
+    let per: Vec<Vec<Vec<u64>>> = pairs
         .par_iter()
         .map(|v| {
-            let mut s: Vec<Vec<(u64, S, P)>> = vec![Vec::new(); SHARDS];
-            for &(ha, a, hb, b, pa, pb) in v {
-                s[(ha >> 56) as usize].push((ha, a, pa));
-                s[(hb >> 56) as usize].push((hb, b, pb));
+            let mut s: Vec<Vec<u64>> = vec![Vec::new(); SHARDS];
+            for &(a, b) in v {
+                s[shard(a)].push(a);
+                s[shard(b)].push(b);
             }
             s
         })
         .collect();
-    let mut shard_tables: Vec<(HashTable<(P, u64)>, Vec<S>)> = (0..SHARDS)
+    let mut tables: Vec<(HashTable<(u64, u64)>, Vec<u64>)> = (0..SHARDS)
         .into_par_iter()
         .map(|sh| {
-            let mut t: HashTable<(P, u64)> = HashTable::new();
-            let mut ids: Vec<S> = Vec::new();
-            for part in &per_shard {
-                for &(h, k, p) in &part[sh] {
-                    if t.find(h, |e| e.0 == p).is_none() {
-                        t.insert_unique(h, (p, ids.len() as u64), |e| phash(e.0));
-                        ids.push(k);
+            let mut t: HashTable<(u64, u64)> = HashTable::new();
+            let mut ids: Vec<u64> = Vec::new();
+            for part in &per {
+                for &c in &part[sh] {
+                    let h = fmix(c);
+                    if t.find(h, |e| e.0 == c).is_none() {
+                        t.insert_unique(h, (c, ids.len() as u64), |e| fmix(e.0));
+                        ids.push(c);
                     }
                 }
             }
             (t, ids)
         })
         .collect();
-    drop(per_shard);
-    // global ids
-    let mut offs = vec![0u32; SHARDS];
-    let mut total = 0u32;
-    for (i, (_, ids)) in shard_tables.iter().enumerate() {
+    drop(per);
+    let mut offs = vec![0u64; SHARDS];
+    let mut total = 0u64;
+    for (i, (_, ids)) in tables.iter().enumerate() {
         offs[i] = total;
-        total += ids.len() as u32;
+        total += ids.len() as u64;
     }
-    let mut all_ids: Vec<S> = Vec::with_capacity(total as usize);
-    for (_, ids) in &shard_tables {
-        all_ids.extend_from_slice(ids);
+    let mut all: Vec<u64> = Vec::with_capacity(total as usize);
+    for (_, ids) in &tables {
+        all.extend_from_slice(ids);
     }
-    shard_tables.par_iter_mut().enumerate().for_each(|(i, (t, _))| {
-        let o = offs[i] as u64;
+    tables.par_iter_mut().enumerate().for_each(|(i, (t, _))| {
+        let o = offs[i];
         for e in t.iter_mut() {
             e.1 += o;
         }
     });
-    let mut shards: Vec<HashTable<(P, u64)>> = shard_tables.into_iter().map(|(t, _)| t).collect();
-    let gid = |h: u64, p: P| -> u32 { shards[(h >> 56) as usize].find(h, |e| e.0 == p).unwrap().1 as u32 };
-    let edges: Vec<Vec<(u32, u32)>> = pairs
-        .par_iter()
-        .map(|v| v.iter().map(|&(ha, _, hb, _, pa, pb)| (gid(ha, pa), gid(hb, pb))).collect())
-        .collect();
+    let gid = |c: u64| -> u32 { tables[shard(c)].0.find(fmix(c), |e| e.0 == c).unwrap().1 as u32 };
+    let edges: Vec<Vec<(u32, u32)>> = pairs.par_iter().map(|v| v.iter().map(|&(a, b)| (gid(a), gid(b))).collect()).collect();
     drop(pairs);
-    let mut parent: Vec<u32> = (0..total).collect();
+    let mut parent: Vec<u32> = (0..total as u32).collect();
     for v in &edges {
         for &(a, b) in v {
             let ra = find(&mut parent, a);
@@ -626,24 +697,28 @@ fn build_people(dir: &Path, t0: Instant) -> People {
         }
     }
     let mut root = vec![0u32; total as usize];
-    for i in 0..total {
+    for i in 0..total as u32 {
         root[i as usize] = find(&mut parent, i);
     }
-    let mut names: Vec<S> = all_ids.clone();
+    // name of each root: the byte-wise smallest member
+    let mut name: Vec<u64> = all.clone();
     for i in 0..total as usize {
         let r = root[i] as usize;
-        if all_ids[i] < names[r] {
-            names[r] = all_ids[i];
+        if cmp_ids(all[i], name[r], side).is_lt() {
+            name[r] = all[i];
         }
     }
-    let root = &root;
-    shards.par_iter_mut().for_each(|t| {
-        for e in t.iter_mut() {
-            e.1 = LINK_BIT | root[e.1 as usize] as u64;
-        }
-    });
-    log(t0, &format!("links: {} ids, {} edges", total, edges.iter().map(|v| v.len()).sum::<usize>()));
-    People { shards, names }
+    let (root, name) = (&root, &name);
+    let shards: Vec<HashTable<(u64, u64)>> = tables
+        .into_par_iter()
+        .map(|(mut t, _)| {
+            for e in t.iter_mut() {
+                e.1 = name[root[e.1 as usize] as usize];
+            }
+            t
+        })
+        .collect();
+    People { shards }
 }
 
 // ---------------------------------------------------------------- parallel helpers
@@ -754,14 +829,15 @@ impl IdMap {
 
 // ---------------------------------------------------------------- records
 
-/// Event payload in one word: ts (ms since window_start, 31 bits) | typ (2) | cat (7) | price (24).
+/// Event payload in one word, ts in the high bits so (key, meta) sorts by time:
+/// ts (ms since window_start, 31 bits) << 33 | typ (2) << 31 | cat (7) << 24 | price (24).
 #[inline]
 fn meta(ts: u32, typ: u8, cat: u32, price: u32) -> u64 {
-    ts as u64 | (typ as u64) << 31 | (cat as u64) << 33 | (price as u64) << 40
+    (ts as u64) << 33 | (typ as u64) << 31 | (cat as u64) << 24 | price as u64
 }
 #[inline]
 fn m_ts(m: u64) -> u32 {
-    (m & 0x7FFF_FFFF) as u32
+    (m >> 33) as u32
 }
 #[inline]
 fn m_typ(m: u64) -> u8 {
@@ -769,59 +845,39 @@ fn m_typ(m: u64) -> u8 {
 }
 #[inline]
 fn m_cat(m: u64) -> usize {
-    ((m >> 33) & 0x7F) as usize
+    ((m >> 24) & 0x7F) as usize
 }
 #[inline]
 fn m_price(m: u64) -> i64 {
-    (m >> 40) as i64
+    (m & 0xFF_FFFF) as i64
 }
 
 /// An event row as parsed, kept for dedup. typ 0 in meta = the row is invalid.
 #[derive(Clone, Copy)]
 struct Raw {
-    eid: P,
-    up: P,
+    eid: u64,
+    user: u64,
     ingest: i64,
     meta: u64,
 }
 
-/// A surviving event, before its person is known.
-#[derive(Clone, Copy)]
-struct EvU {
-    up: P,
-    meta: u64,
-}
-
+/// A surviving event: its user code (before person resolution) or person key (after).
 #[derive(Clone, Copy)]
 struct Ev {
     key: u64,
     meta: u64,
-    up: P,
-}
-
-#[derive(Clone, Copy)]
-struct ClkU {
-    up: P,
-    ts: i64,
-    cid: S,
-    camp: u32,
 }
 
 #[derive(Clone, Copy)]
 struct Clk {
     key: u64,
-    ts: i64,
-    cid: S,
+    cid: u64,
+    ts: u32, // ms since window_start - 7 days
     camp: u32,
 }
 
-enum Name {
-    Str(S),
-    Packed(P),
-}
-
 struct UserRow {
-    name: Name,
+    key: u64,
     day: i32,
     sessions: i64,
     events: i64,
@@ -831,6 +887,7 @@ struct UserRow {
 
 struct Ctx {
     ws: i64,
+    cws: i64,
     day0: i64,
     ndays: usize,
     ncamp: usize, // organic = ncamp
@@ -856,16 +913,15 @@ struct Scratch {
 
 fn process_bucket(
     ctx: &Ctx,
-    people: &People,
-    long_names: &hashbrown::HashMap<P, S>,
+    side: &Side,
     evs: &mut [Ev],
     clks: &mut [Clk],
     rows: &mut Vec<UserRow>,
     acc: &mut Acc,
     sc: &mut Scratch,
 ) {
-    evs.sort_unstable_by_key(|e| (e.key, m_ts(e.meta)));
-    clks.sort_unstable_by(|a, b| (a.key, a.ts, a.cid).cmp(&(b.key, b.ts, b.cid)));
+    evs.sort_unstable_by_key(|e| (e.key, e.meta));
+    clks.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| cmp_ids(a.cid, b.cid, side)));
     let Scratch { catsum, touched, sess, ct } = sc;
     let mut ci = 0usize;
     let mut i = 0usize;
@@ -877,16 +933,6 @@ fn process_bucket(
             j += 1;
         }
         let g = &evs[i..j];
-        let up = g[0].up;
-        let name = || -> Name {
-            if key & LINK_BIT != 0 {
-                Name::Str(people.names[(key & !LINK_BIT) as usize])
-            } else if is_short(up) {
-                Name::Packed(up)
-            } else {
-                Name::Str(long_names[&up])
-            }
-        };
         // sessions and user rows
         sess.clear();
         let mut cur_day: i64 = i64::MIN;
@@ -916,7 +962,7 @@ fn process_bucket(
                 catsum[c as usize] = 0;
             }
             touched.clear();
-            rows.push(UserRow { name: name(), day: day as i32, sessions: ds, events: de, revenue: dr, top });
+            rows.push(UserRow { key, day: day as i32, sessions: ds, events: de, revenue: dr, top });
         };
         while k < g.len() {
             let t0 = m_ts(g[k].meta);
@@ -974,16 +1020,26 @@ fn process_bucket(
         }
         let c = &clks[ci..cj];
         ci = cj;
+        if c.is_empty() {
+            for s in sess.iter() {
+                let a = &mut acc[ctx.ncamp * nd + s.d];
+                a[0] += 1;
+                a[1] += s.purch as i64;
+                a[2] += s.rev;
+            }
+            i = j;
+            continue;
+        }
         // credit: latest click at or before the start, within 7 days; ties -> smallest click_id
         let mut p = 0usize;
         for s in sess.iter() {
-            while p < c.len() && c[p].ts <= s.start {
+            while p < c.len() && ctx.cws + c[p].ts as i64 <= s.start {
                 p += 1;
             }
             let mut camp = ctx.ncamp;
             if p > 0 {
                 let t = c[p - 1].ts;
-                if s.start - t <= WEEK {
+                if s.start - (ctx.cws + t as i64) <= WEEK {
                     let mut q = p - 1;
                     while q > 0 && c[q - 1].ts == t {
                         q -= 1;
@@ -993,41 +1049,37 @@ fn process_bucket(
             }
             let a = &mut acc[camp * nd + s.d];
             a[0] += 1;
-            if s.purch {
-                a[1] += 1;
-            }
+            a[1] += s.purch as i64;
             a[2] += s.rev;
         }
         // assists: per campaign, the union of [click, click + 7d] covers the assisted starts
-        if !c.is_empty() {
-            ct.clear();
-            ct.extend(c.iter().map(|x| (x.camp, x.ts)));
-            ct.sort_unstable();
-            let mut x = 0;
-            while x < ct.len() {
-                let camp = ct[x].0;
-                let mut a = ct[x].1;
-                let mut b = a + WEEK;
-                x += 1;
-                loop {
-                    let more = x < ct.len() && ct[x].0 == camp;
-                    if more && ct[x].1 <= b {
-                        b = ct[x].1 + WEEK;
-                        x += 1;
-                        continue;
-                    }
-                    let lo = sess.partition_point(|s| s.start < a);
-                    let hi = sess.partition_point(|s| s.start <= b);
-                    for s in &sess[lo..hi] {
-                        acc[camp as usize * nd + s.d][3] += 1;
-                    }
-                    if more {
-                        a = ct[x].1;
-                        b = a + WEEK;
-                        x += 1;
-                    } else {
-                        break;
-                    }
+        ct.clear();
+        ct.extend(c.iter().map(|x| (x.camp, ctx.cws + x.ts as i64)));
+        ct.sort_unstable();
+        let mut x = 0;
+        while x < ct.len() {
+            let camp = ct[x].0;
+            let mut a = ct[x].1;
+            let mut b = a + WEEK;
+            x += 1;
+            loop {
+                let more = x < ct.len() && ct[x].0 == camp;
+                if more && ct[x].1 <= b {
+                    b = ct[x].1 + WEEK;
+                    x += 1;
+                    continue;
+                }
+                let lo = sess.partition_point(|s| s.start < a);
+                let hi = sess.partition_point(|s| s.start <= b);
+                for s in &sess[lo..hi] {
+                    acc[camp as usize * nd + s.d][3] += 1;
+                }
+                if more {
+                    a = ct[x].1;
+                    b = a + WEEK;
+                    x += 1;
+                } else {
+                    break;
                 }
             }
         }
@@ -1112,7 +1164,7 @@ fn main() {
     let manifest = std::fs::read(data_dir.join("manifest.json")).expect("manifest");
     let ws = manifest_ts(&manifest, "window_start");
     let we = manifest_ts(&manifest, "window_end");
-    assert!(we - ws < (1i64 << 31), "window too long for 31-bit timestamps");
+    assert!(we - ws + WEEK < (1i64 << 31), "window too long for 31-bit timestamps");
     let cws = ws - WEEK;
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
@@ -1146,31 +1198,32 @@ fn main() {
     let camp = IdMap::build(&camp_ids, b"c_");
     let ncamp = camp_names.len();
     camp_names.push((b"organic", b"organic"));
-    let ctx = Ctx { ws, day0, ndays, ncamp, ncat: catnames.len() };
+    let ctx = Ctx { ws, cws, day0, ndays, ncamp, ncat: catnames.len() };
     log(t0, &format!("setup: {} products, {} campaigns, {} days, {} threads", prods.len(), ncamp, ndays, threads));
 
-    let people = build_people(&data_dir.join("links"), t0);
+    // ---- parse links, events and clicks
+    let (pairs, mut side_list) = parse_links(&data_dir.join("links"), threads);
+    log(t0, "links parsed");
 
-    // ---- events: parse into per-thread partitions by event_id hash
     let ech = chunks(&data_dir.join("events"));
     let ebytes: usize = ech.iter().map(|c| c.len()).sum();
     let est_lines = ebytes / 70 + 1;
-    let dbits = ((est_lines / 40_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 12);
+    let dbits = ((est_lines / 160_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 11);
     let nd_parts = 1usize << dbits;
     let dshift = 64 - dbits;
     let cap = est_lines / (threads * nd_parts) * 5 / 4 + 16;
-    let parsed: Vec<(Vec<Vec<Raw>>, Vec<(P, S)>)> = run_par(
+    let parsed: Vec<(Vec<Vec<Raw>>, Vec<(u64, S)>)> = run_par(
         ech.len(),
         threads,
         || (parts::<Raw>(nd_parts, cap), Vec::new()),
-        |(out, long), ci| {
+        |(out, side), ci| {
             scan::<7>(ech[ci], |f| {
                 if f[0].is_empty() {
                     return;
                 }
-                let eid = pack(f[0]);
+                let eid = enc(f[0]);
                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
-                let mut r = Raw { eid, up: (0, 0), ingest, meta: 0 };
+                let mut r = Raw { eid, user: 0, ingest, meta: 0 };
                 let typ: u8 = match f[4] {
                     b"view" => 1,
                     b"cart" => 2,
@@ -1184,30 +1237,81 @@ fn main() {
                             if let Some(price) = price {
                                 let cat = prod.get(f[5]).unwrap_or(unknown);
                                 r.meta = meta((ts - ws) as u32, typ, cat, price);
-                                r.up = pack(f[1]);
-                                if !is_short(r.up) {
-                                    long.push((r.up, f[1]));
+                                r.user = enc(f[1]);
+                                if r.user & HBIT != 0 {
+                                    side.push((r.user, f[1]));
                                 }
                             }
                         }
                     }
                 }
-                out[(phash(eid) >> dshift) as usize].push(r);
+                out[(fmix(eid) >> dshift) as usize].push(r);
             });
         },
     );
-    let mut long_names: hashbrown::HashMap<P, S> = hashbrown::HashMap::new();
-    for (_, l) in &parsed {
-        long_names.extend(l.iter().copied());
-    }
     log(t0, &format!("events parsed: {} chunks, {} dedup partitions", ech.len(), nd_parts));
+
+    let cch = chunks(&data_dir.join("clicks"));
+    let cbytes: usize = cch.iter().map(|c| c.len()).sum();
+    let est_clicks = cbytes / 45 + 1;
+    let ccap = est_clicks / (threads * SHARDS) * 5 / 4 + 16;
+    let cparsed: Vec<(Vec<Vec<Clk>>, Vec<(u64, S)>)> = run_par(
+        cch.len(),
+        threads,
+        || (parts::<Clk>(SHARDS, ccap), Vec::new()),
+        |(out, side), ci| {
+            scan::<4>(cch[ci], |f| {
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
+                }
+                let ts = match parse_ts(f[3]) {
+                    Some(t) if t >= cws && t < we => t,
+                    _ => return,
+                };
+                let cp = match camp.get(f[2]) {
+                    Some(c) => c,
+                    None => return,
+                };
+                let user = enc(f[1]);
+                let cid = enc(f[0]);
+                if user & HBIT != 0 {
+                    side.push((user, f[1]));
+                }
+                if cid & HBIT != 0 {
+                    side.push((cid, f[0]));
+                }
+                out[shard(user)].push(Clk { key: user, cid, ts: (ts - cws) as u32, camp: cp });
+            });
+        },
+    );
+    log(t0, "clicks parsed");
+
+    // hashed IDs: original text (for names and click_id tie-breaks)
+    for (_, s) in &parsed {
+        side_list.extend_from_slice(s);
+    }
+    for (_, s) in &cparsed {
+        side_list.extend_from_slice(s);
+    }
+    let mut side: Side = Side::new();
+    for (c, s) in side_list {
+        if let Some(&o) = side.get(&c) {
+            assert!(o == s, "64-bit hash collision between two IDs");
+        } else {
+            side.insert(c, s);
+        }
+    }
+    let side = &side;
+
+    let people = build_people(pairs, side, threads);
+    log(t0, "people built");
 
     // ---- dedup each partition: keep the copy with the smallest ingest_ts, then drop it if invalid
     let ucap = est_lines / (threads * SHARDS) * 5 / 4 + 16;
-    let survivors: Vec<(Vec<Vec<EvU>>, Vec<u64>)> = run_par(
+    let survivors: Vec<(Vec<Vec<Ev>>, Vec<u64>)> = run_par(
         nd_parts,
         threads,
-        || (parts::<EvU>(SHARDS, ucap), Vec::new()),
+        || (parts::<Ev>(SHARDS, ucap), Vec::new()),
         |(out, table), b| {
             let segs: Vec<&[Raw]> = parsed.iter().map(|(p, _)| &p[b][..]).collect();
             let mut offs = Vec::with_capacity(segs.len() + 1);
@@ -1232,7 +1336,7 @@ fn main() {
             let mut g = 0usize;
             for s in &segs {
                 for r in s.iter() {
-                    let h = phash(r.eid);
+                    let h = fmix(r.eid);
                     let fp = (h >> 16) & 0xFFFF_FFFF;
                     let mut pos = (h as usize) & mask;
                     loop {
@@ -1242,8 +1346,7 @@ fn main() {
                             break;
                         }
                         if slot >> 32 == fp {
-                            let j = (slot & 0xFFFF_FFFF) as usize - 1;
-                            let o = get(j);
+                            let o = get((slot & 0xFFFF_FFFF) as usize - 1);
                             if o.eid == r.eid {
                                 if r.ingest < o.ingest {
                                     table[pos] = (fp << 32) | (g as u64 + 1);
@@ -1264,7 +1367,7 @@ fn main() {
                 if m_typ(r.meta) == 0 {
                     continue;
                 }
-                out[(phash(r.up) >> 56) as usize].push(EvU { up: r.up, meta: r.meta });
+                out[shard(r.user)].push(Ev { key: r.user, meta: r.meta });
             }
         },
     );
@@ -1277,65 +1380,29 @@ fn main() {
     let pshift = 64 - pbits;
     let pb = |key: u64| -> usize { (fmix(key ^ 0x5bd1e995) >> pshift) as usize };
     let pcap = est_lines / (threads * np) * 5 / 4 + 16;
-    let events: Vec<Vec<Vec<Ev>>> = run_par(
+    let pccap = est_clicks / (threads * np) * 5 / 4 + 16;
+    let resolved: Vec<(Vec<Vec<Ev>>, Vec<Vec<Clk>>)> = run_par(
         SHARDS,
         threads,
-        || parts::<Ev>(np, pcap),
-        |out, sh| {
+        || (parts::<Ev>(np, pcap), parts::<Clk>(np, pccap)),
+        |(eo, co), sh| {
             for (part, _) in &survivors {
                 for e in &part[sh] {
-                    let key = people.key_packed(e.up, phash(e.up));
-                    out[pb(key)].push(Ev { key, meta: e.meta, up: e.up });
+                    let key = people.key(e.key);
+                    eo[pb(key)].push(Ev { key, meta: e.meta });
+                }
+            }
+            for (part, _) in &cparsed {
+                for c in &part[sh] {
+                    let key = people.key(c.key);
+                    co[pb(key)].push(Clk { key, ..*c });
                 }
             }
         },
     );
     drop(survivors);
-    log(t0, "event persons resolved");
-
-    // ---- clicks (copies are identical, so duplicates never change credit or assists)
-    let cch = chunks(&data_dir.join("clicks"));
-    let cbytes: usize = cch.iter().map(|c| c.len()).sum();
-    let est_clicks = cbytes / 45 + 1;
-    let ccap = est_clicks / (threads * SHARDS) * 5 / 4 + 16;
-    let cparsed: Vec<Vec<Vec<ClkU>>> = run_par(
-        cch.len(),
-        threads,
-        || parts::<ClkU>(SHARDS, ccap),
-        |out, ci| {
-            scan::<4>(cch[ci], |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let ts = match parse_ts(f[3]) {
-                    Some(t) if t >= cws && t < we => t,
-                    _ => return,
-                };
-                let cp = match camp.get(f[2]) {
-                    Some(c) => c,
-                    None => return,
-                };
-                let up = pack(f[1]);
-                out[(phash(up) >> 56) as usize].push(ClkU { up, ts, cid: f[0], camp: cp });
-            });
-        },
-    );
-    let pccap = est_clicks / (threads * np) * 5 / 4 + 16;
-    let clicks: Vec<Vec<Vec<Clk>>> = run_par(
-        SHARDS,
-        threads,
-        || parts::<Clk>(np, pccap),
-        |out, sh| {
-            for part in &cparsed {
-                for c in &part[sh] {
-                    let key = people.key_packed(c.up, phash(c.up));
-                    out[pb(key)].push(Clk { key, ts: c.ts, cid: c.cid, camp: c.camp });
-                }
-            }
-        },
-    );
     drop(cparsed);
-    log(t0, "clicks parsed");
+    log(t0, "persons resolved");
 
     // ---- per person bucket: sessions, user rows, credit and assists
     let res: Vec<(Vec<UserRow>, Acc, Vec<Ev>, Vec<Clk>, Scratch)> = run_par(
@@ -1352,18 +1419,15 @@ fn main() {
         },
         |(rows, acc, evs, cl, sc), b| {
             evs.clear();
-            for part in &events {
-                evs.extend_from_slice(&part[b]);
-            }
             cl.clear();
-            for part in &clicks {
-                cl.extend_from_slice(&part[b]);
+            for (e, c) in &resolved {
+                evs.extend_from_slice(&e[b]);
+                cl.extend_from_slice(&c[b]);
             }
-            process_bucket(&ctx, &people, &long_names, evs, cl, rows, acc, sc);
+            process_bucket(&ctx, side, evs, cl, rows, acc, sc);
         },
     );
-    drop(events);
-    drop(clicks);
+    drop(resolved);
     let mut acc = vec![[0i64; 4]; (ncamp + 1) * ndays];
     let mut row_sets: Vec<Vec<UserRow>> = Vec::new();
     for (r, a, _, _, _) in res {
@@ -1420,12 +1484,7 @@ fn main() {
                 use pq::Col;
                 let cols = vec![
                     Col::Str(
-                        rs.iter()
-                            .map(|r| match r.name {
-                                Name::Str(s) => pq::ba(s),
-                                Name::Packed(p) => parquet::data_type::ByteArray::from(unpack(p)),
-                            })
-                            .collect(),
+                        rs.iter().map(|r| parquet::data_type::ByteArray::from(id_bytes(r.key, side))).collect(),
                         None,
                     ),
                     Col::I32(rs.iter().map(|r| r.day).collect()),
