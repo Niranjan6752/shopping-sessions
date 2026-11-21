@@ -202,7 +202,7 @@ fn classify(block: &[u8; 64]) -> (u64, u64, u64) {
 /// Call f with the N unquoted fields of every well-formed line in chunk (CSV dialect of rules.md).
 /// Walks only comma and newline bits; quotes are counted with popcount.
 #[inline(always)]
-fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
+fn scan_blocks<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
     let len = chunk.len();
     let mut ends = [0usize; 8]; // end offsets of fields (commas); slot N.. absorbs extras
     let mut nc = 0usize; // commas seen in this line
@@ -272,6 +272,85 @@ fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
     if start < len {
         emit(start, len, nc, q_base - q_line, &ends);
     }
+}
+
+
+/// Line-at-a-time scanner: for each line, one 128-byte window gives newline, comma and quote
+/// bitmasks; the line end is the first newline bit and the N-1 commas are peeled off the
+/// comma mask with no data-dependent branches. Lines longer than the window and the last
+/// lines of the chunk go through `scan_blocks`. Same results as `scan_blocks`.
+#[inline(always)]
+fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let len = chunk.len();
+        let mut start = 0usize;
+        let mut out: [S; N] = [&[]; N];
+        let mut pos = [0usize; 8];
+        unsafe {
+            let nl = _mm256_set1_epi8(b'\n' as i8);
+            let cm = _mm256_set1_epi8(b',' as i8);
+            let qt = _mm256_set1_epi8(b'"' as i8);
+            while start + 128 <= len {
+                let p = chunk.as_ptr().add(start);
+                let v0 = _mm256_loadu_si256(p as *const __m256i);
+                let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+                let v2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
+                let v3 = _mm256_loadu_si256(p.add(96) as *const __m256i);
+                let mask = |c: __m256i| -> u128 {
+                    let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, c)) as u32 as u128;
+                    let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, c)) as u32 as u128;
+                    let d = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v2, c)) as u32 as u128;
+                    let e = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v3, c)) as u32 as u128;
+                    a | b << 32 | d << 64 | e << 96
+                };
+                let mn = mask(nl);
+                if mn == 0 {
+                    break; // a line longer than the window: finish with the block scanner
+                }
+                let e = mn.trailing_zeros() as usize;
+                let lm = (1u128 << e) - 1;
+                let mut mc = mask(cm) & lm;
+                if mc.count_ones() as usize == N - 1 {
+                    for k in 0..N - 1 {
+                        pos[k] = start + mc.trailing_zeros() as usize;
+                        mc &= mc - 1;
+                    }
+                    pos[N - 1] = start + e;
+                    let nq = (mask(qt) & lm).count_ones();
+                    let mut s = start;
+                    if nq == 0 {
+                        for k in 0..N {
+                            out[k] = chunk.get_unchecked(s..pos[k]);
+                            s = pos[k] + 1;
+                        }
+                        f(&out);
+                    } else {
+                        let mut wrapped = 0u32;
+                        for k in 0..N {
+                            let e = pos[k];
+                            let w = if e - s >= 2 {
+                                ((*chunk.get_unchecked(s) == b'"') & (*chunk.get_unchecked(e - 1) == b'"')) as usize
+                            } else {
+                                0
+                            };
+                            out[k] = chunk.get_unchecked(s + w..e - w);
+                            wrapped += 2 * w as u32;
+                            s = e + 1;
+                        }
+                        if wrapped == nq {
+                            f(&out);
+                        }
+                    }
+                }
+                start += e + 1;
+            }
+        }
+        scan_blocks::<N>(&chunk[start..], f);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    scan_blocks::<N>(chunk, f);
 }
 
 // ---------------------------------------------------------------- timestamps
