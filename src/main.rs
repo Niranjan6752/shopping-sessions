@@ -413,12 +413,20 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
         return parse_iso(b);
     }
     // F3: ASCII digits only
-    if n <= 16 {
-        let mut buf = [b'0'; 16];
-        buf[16 - n..].copy_from_slice(b);
-        let a = digits8(u64::from_le_bytes(buf[..8].try_into().unwrap()))?;
-        let c = digits8(u64::from_le_bytes(buf[8..].try_into().unwrap()))?;
+    if n > 8 && n <= 16 {
+        // two overlapping in-bounds loads: the last 8 digits, and the first n-8 shifted up
+        // with '0' filled in below them (no copy through memory, so no store-forwarding stall)
+        let c = digits8(u64::from_le_bytes(b[n - 8..].try_into().unwrap()))?;
+        let sh = 8 * (16 - n) as u32;
+        let x = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let hi = if sh == 0 { x } else { (x << sh) | (0x3030_3030_3030_3030u64 >> (64 - sh)) };
+        let a = digits8(hi)?;
         return Some((a * 100_000_000 + c) as i64);
+    }
+    if n <= 8 {
+        let mut buf = [b'0'; 8];
+        buf[8 - n..].copy_from_slice(b);
+        return digits8(u64::from_le_bytes(buf)).map(|v| v as i64);
     }
     let mut v: u64 = 0;
     for &c in b {
@@ -627,6 +635,81 @@ impl People {
     }
 }
 
+/// Flat open-addressing map user code -> person key for IDs whose person is not themselves.
+/// Built once, then read by every thread with software prefetch ahead of each lookup.
+/// Codes are never 0 (an ID has at least one character), so 0 marks an empty slot.
+struct PersonMap {
+    slots: *mut [u64; 2],
+    mask: usize,
+}
+unsafe impl Sync for PersonMap {}
+unsafe impl Send for PersonMap {}
+
+impl PersonMap {
+    fn build(people: &People) -> PersonMap {
+        let total: usize = people.shards.iter().map(|t| t.iter().filter(|e| e.0 != e.1).count()).sum();
+        let n = (total * 2).next_power_of_two().max(1 << 12);
+        let bytes = n * 16;
+        let slots = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED, "mmap failed");
+            libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+            p as *mut [u64; 2]
+        };
+        let map = PersonMap { slots, mask: n - 1 };
+        // parallel insert: claim a slot's key with compare-and-swap, then write its value
+        let cells = unsafe { std::slice::from_raw_parts(slots as *const std::sync::atomic::AtomicU64, n * 2) };
+        people.shards.par_iter().for_each(|t| {
+            for &(code, key) in t.iter() {
+                if code == key {
+                    continue; // a miss returns the code itself
+                }
+                let mut pos = (fmix(code) as usize) & map.mask;
+                loop {
+                    match cells[pos * 2].compare_exchange(0, code, Relaxed, Relaxed) {
+                        Ok(_) => {
+                            cells[pos * 2 + 1].store(key, Relaxed);
+                            break;
+                        }
+                        Err(_) => pos = (pos + 1) & map.mask,
+                    }
+                }
+            }
+        });
+        map
+    }
+    #[inline(always)]
+    fn prefetch(&self, code: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let pos = (fmix(code) as usize) & self.mask;
+            _mm_prefetch(self.slots.add(pos) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
+    fn key(&self, code: u64) -> u64 {
+        let mut pos = (fmix(code) as usize) & self.mask;
+        loop {
+            let [k, v] = unsafe { *self.slots.add(pos) };
+            if k == code {
+                return v;
+            }
+            if k == 0 {
+                return code;
+            }
+            pos = (pos + 1) & self.mask;
+        }
+    }
+}
+
 fn find(p: &mut [u32], mut x: u32) -> u32 {
     while p[x as usize] != x {
         let gp = p[p[x as usize] as usize];
@@ -807,8 +890,13 @@ struct IdMap {
 
 #[inline]
 fn canon_num(s: &[u8], prefix: &[u8]) -> Option<usize> {
-    if s.len() <= prefix.len() || s.len() > prefix.len() + 7 || &s[..prefix.len()] != prefix {
+    if s.len() <= prefix.len() || s.len() > prefix.len() + 7 {
         return None;
+    }
+    for i in 0..prefix.len() {
+        if s[i] != prefix[i] {
+            return None;
+        }
     }
     let d = &s[prefix.len()..];
     if d[0] == b'0' && d.len() > 1 {
@@ -1477,7 +1565,7 @@ fn main() {
     let (pairs, mut side_list) = parse_links(&data_dir.join("links"), threads);
     // the person table is only needed after dedup: build it while events are parsed
     let link_side: Side = side_list.iter().copied().collect();
-    let people_thread = std::thread::spawn(move || build_people(pairs, &link_side, threads));
+    let people_thread = std::thread::spawn(move || PersonMap::build(&build_people(pairs, &link_side, threads)));
     log(t0, "links parsed");
 
     let ech = chunks(&data_dir.join("events"));
@@ -1532,15 +1620,27 @@ fn main() {
     );
     log(t0, &format!("events parsed: {} chunks, {} dedup partitions", ech.len(), nd_parts));
 
+    let pmap = people_thread.join().unwrap();
+    let pmap = &pmap;
+    log(t0, "people built");
+    let pbits = ((est_lines / 60_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 12);
+    let np = 1usize << pbits;
+    let pshift = 64 - pbits;
+    let pb = |key: u64| -> usize { (fmix(key ^ 0x5bd1e995) >> pshift) as usize };
+
     let cch = chunks(&data_dir.join("clicks"));
     let cbytes: usize = cch.iter().map(|c| c.len()).sum();
     let est_clicks = cbytes / 45 + 1;
-    let ccap = est_clicks / (threads * SHARDS) * 5 / 4 + 16;
+    let ccap = est_clicks / (threads * np) * 5 / 4 + 16;
+    const RING: usize = 16;
     let cparsed: Vec<(Vec<Vec<Clk>>, Vec<(u64, S)>)> = run_par(
         cch.len(),
         threads,
-        || (parts::<Clk>(SHARDS, ccap), Vec::new()),
+        || (parts::<Clk>(np, ccap), Vec::new()),
         |(out, side), ci| {
+            // look persons up RING clicks after prefetching their slot
+            let mut ring = [Clk { key: 0, cid: 0, ts: 0, camp: 0 }; RING];
+            let mut n = 0usize;
             scan::<4>(cch[ci], |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
@@ -1561,8 +1661,21 @@ fn main() {
                 if cid & HBIT != 0 {
                     side.push((cid, f[0]));
                 }
-                out[shard(user)].push(Clk { key: user, cid, ts: (ts - cws) as u32, camp: cp });
+                pmap.prefetch(user);
+                let slot = n % RING;
+                if n >= RING {
+                    let c = ring[slot];
+                    let key = pmap.key(c.key);
+                    out[pb(key)].push(Clk { key, ..c });
+                }
+                ring[slot] = Clk { key: user, cid, ts: (ts - cws) as u32, camp: cp };
+                n += 1;
             });
+            for i in n.saturating_sub(RING)..n {
+                let c = ring[i % RING];
+                let key = pmap.key(c.key);
+                out[pb(key)].push(Clk { key, ..c });
+            }
         },
     );
     log(t0, "clicks parsed");
@@ -1584,16 +1697,13 @@ fn main() {
     }
     let side = &side;
 
-    let people = people_thread.join().unwrap();
-    log(t0, "people built");
-
     // ---- dedup each partition: keep the copy with the smallest ingest_ts, then drop it if invalid
-    let ucap = est_lines / (threads * SHARDS) * 5 / 4 + 16;
-    let survivors: Vec<(Vec<Vec<Ev>>, Vec<u64>)> = run_par(
+    let ucap = est_lines / (threads * np) * 5 / 4 + 16;
+    let survivors: Vec<(Vec<Vec<Ev>>, Vec<u64>, Vec<u64>)> = run_par(
         nd_parts,
         threads,
-        || (parts::<Ev>(SHARDS, ucap), Vec::new()),
-        |(out, table), b| {
+        || (parts::<Ev>(np, ucap), Vec::new(), Vec::<u64>::new()),
+        |(out, table, win), b| {
             let segs: Vec<&[Raw]> = parsed.iter().map(|(p, _)| &p[b][..]).collect();
             let mut offs = Vec::with_capacity(segs.len() + 1);
             let mut n = 0usize;
@@ -1613,10 +1723,22 @@ fn main() {
             let mask = size - 1;
             table.clear();
             table.resize(size, 0);
-            // slot: (32-bit fingerprint << 32) | (index + 1); 0 = empty
+            // slot: (32-bit fingerprint << 32) | (index + 1); 0 = empty.
+            // win: bitmap of the current winner of each event_id, so the output pass can read
+            // records in order instead of hopping through the table.
+            win.clear();
+            win.resize(n / 64 + 1, 0);
             let mut g = 0usize;
             for s in &segs {
-                for r in s.iter() {
+                for (ri, r) in s.iter().enumerate() {
+                    #[cfg(target_arch = "x86_64")]
+                    if ri + 16 < s.len() {
+                        unsafe {
+                            use std::arch::x86_64::*;
+                            let ph = (fmix(s[ri + 16].eid) as usize) & mask;
+                            _mm_prefetch(table.as_ptr().add(ph) as *const i8, _MM_HINT_T0);
+                        }
+                    }
                     let h = fmix(r.eid);
                     let fp = (h >> 16) & 0xFFFF_FFFF;
                     let mut pos = (h as usize) & mask;
@@ -1624,13 +1746,17 @@ fn main() {
                         let slot = table[pos];
                         if slot == 0 {
                             table[pos] = (fp << 32) | (g as u64 + 1);
+                            win[g >> 6] |= 1 << (g & 63);
                             break;
                         }
                         if slot >> 32 == fp {
-                            let o = get((slot & 0xFFFF_FFFF) as usize - 1);
+                            let j = (slot & 0xFFFF_FFFF) as usize - 1;
+                            let o = get(j);
                             if o.eid == r.eid {
                                 if r.ingest < o.ingest {
                                     table[pos] = (fp << 32) | (g as u64 + 1);
+                                    win[j >> 6] &= !(1 << (j & 63));
+                                    win[g >> 6] |= 1 << (g & 63);
                                 }
                                 break;
                             }
@@ -1640,50 +1766,24 @@ fn main() {
                     g += 1;
                 }
             }
-            for &slot in table.iter() {
-                if slot == 0 {
-                    continue;
+            let mut g = 0usize;
+            for s in &segs {
+                for (ri, r) in s.iter().enumerate() {
+                    if ri + 16 < s.len() {
+                        pmap.prefetch(s[ri + 16].user);
+                    }
+                    if win[g >> 6] >> (g & 63) & 1 != 0 && m_typ(r.meta) != 0 {
+                        let key = pmap.key(r.user);
+                        out[pb(key)].push(Ev { key, meta: r.meta });
+                    }
+                    g += 1;
                 }
-                let r = get((slot & 0xFFFF_FFFF) as usize - 1);
-                if m_typ(r.meta) == 0 {
-                    continue;
-                }
-                out[shard(r.user)].push(Ev { key: r.user, meta: r.meta });
             }
         },
     );
     drop(parsed);
     log(t0, "events deduped");
 
-    // ---- resolve persons one ID shard at a time (each shard's table stays in cache)
-    let pbits = ((est_lines / 60_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 12);
-    let np = 1usize << pbits;
-    let pshift = 64 - pbits;
-    let pb = |key: u64| -> usize { (fmix(key ^ 0x5bd1e995) >> pshift) as usize };
-    let pcap = est_lines / (threads * np) * 5 / 4 + 16;
-    let pccap = est_clicks / (threads * np) * 5 / 4 + 16;
-    let resolved: Vec<(Vec<Vec<Ev>>, Vec<Vec<Clk>>)> = run_par(
-        SHARDS,
-        threads,
-        || (parts::<Ev>(np, pcap), parts::<Clk>(np, pccap)),
-        |(eo, co), sh| {
-            for (part, _) in &survivors {
-                for e in &part[sh] {
-                    let key = people.key(e.key);
-                    eo[pb(key)].push(Ev { key, meta: e.meta });
-                }
-            }
-            for (part, _) in &cparsed {
-                for c in &part[sh] {
-                    let key = people.key(c.key);
-                    co[pb(key)].push(Clk { key, ..*c });
-                }
-            }
-        },
-    );
-    drop(survivors);
-    drop(cparsed);
-    log(t0, "persons resolved");
 
     // ---- per person bucket: sessions, user rows, credit and assists
     let res: Vec<(Vec<UserRow>, Acc, Vec<Ev>, Vec<Clk>, Scratch)> = run_par(
@@ -1701,14 +1801,17 @@ fn main() {
         |(rows, acc, evs, cl, sc), b| {
             evs.clear();
             cl.clear();
-            for (e, c) in &resolved {
+            for (e, _, _) in &survivors {
                 evs.extend_from_slice(&e[b]);
+            }
+            for (c, _) in &cparsed {
                 cl.extend_from_slice(&c[b]);
             }
             process_bucket(&ctx, side, evs, cl, rows, acc, sc);
         },
     );
-    drop(resolved);
+    drop(survivors);
+    drop(cparsed);
     let mut acc = vec![[0i64; 4]; (ncamp + 1) * ndays];
     let mut row_sets: Vec<Vec<UserRow>> = Vec::new();
     for (r, a, _, _, _) in res {
