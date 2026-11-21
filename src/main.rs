@@ -294,6 +294,8 @@ fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
             let qt = _mm256_set1_epi8(b'"' as i8);
             while start + 128 <= len {
                 let p = chunk.as_ptr().add(start);
+                // the hardware prefetcher stops at 4 KB page edges: fetch ahead explicitly
+                _mm_prefetch(p.add(1024) as *const i8, _MM_HINT_T0);
                 let v0 = _mm256_loadu_si256(p as *const __m256i);
                 let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
                 let v2 = _mm256_loadu_si256(p.add(64) as *const __m256i);
@@ -969,7 +971,7 @@ fn parts<R>(n: usize, cap: usize) -> Vec<Vec<R>> {
 /// is not canonical cannot equal any canonical ID, so both paths are exact.
 struct IdMap {
     prefix: &'static [u8],
-    arr: Vec<u32>,
+    arr: Vec<u16>,
     hash: Lookup,
     fast: bool,
 }
@@ -1007,18 +1009,19 @@ impl IdMap {
         }
         let nums: Option<Vec<usize>> = ids.iter().map(|&(k, _)| canon_num(k, prefix)).collect();
         let mut arr = Vec::new();
+        let small = ids.iter().all(|&(_, v)| v < u16::MAX as u32);
         let fast = match nums {
-            Some(nums) => {
+            Some(nums) if small => {
                 let max = nums.iter().copied().max().unwrap_or(0);
-                arr = vec![u32::MAX; max + 1];
+                arr = vec![u16::MAX; max + 1];
                 for (&n, &(k, _)) in nums.iter().zip(ids) {
-                    if arr[n] == u32::MAX {
-                        arr[n] = hash.get(k).unwrap();
+                    if arr[n] == u16::MAX {
+                        arr[n] = hash.get(k).unwrap() as u16;
                     }
                 }
                 true
             }
-            None => false,
+            _ => false,
         };
         IdMap { prefix, arr, hash, fast }
     }
@@ -1027,7 +1030,7 @@ impl IdMap {
         if self.fast {
             let n = canon_num(s, self.prefix)?;
             match self.arr.get(n) {
-                Some(&v) if v != u32::MAX => Some(v),
+                Some(&v) if v != u16::MAX => Some(v as u32),
                 _ => None,
             }
         } else {
