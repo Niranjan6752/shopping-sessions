@@ -1640,52 +1640,138 @@ fn main() {
     let est_clicks = cbytes / 45 + 1;
     let ccap = est_clicks / (threads * np) * 5 / 4 + 16;
     const RING: usize = 16;
-    let cparsed: Vec<(Vec<Vec<Clk>>, Vec<(u64, S)>)> = run_par(
-        cch.len(),
+    // ---- one pool: dedup each event partition (keep the copy with the smallest ingest_ts, drop
+    // it if invalid), and parse click chunks; both map users to persons on the way out
+    let ucap = est_lines / (threads * np) * 5 / 4 + 16;
+    #[allow(clippy::type_complexity)]
+    let both: Vec<((Vec<Vec<Ev>>, Vec<u64>, Vec<u64>), (Vec<Vec<Clk>>, Vec<(u64, S)>))> = run_par(
+        nd_parts + cch.len(),
         threads,
-        || (parts::<Clk>(np, ccap), Vec::new()),
-        |(out, side), ci| {
-            // look persons up RING clicks after prefetching their slot
-            let mut ring = [Clk { key: 0, cid: 0, ts: 0, camp: 0 }; RING];
-            let mut n = 0usize;
-            scan::<4>(cch[ci], |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let ts = match parse_ts(f[3]) {
-                    Some(t) if t >= cws && t < we => t,
-                    _ => return,
-                };
-                let cp = match camp.get(f[2]) {
-                    Some(c) => c,
-                    None => return,
-                };
-                let user = enc(f[1]);
-                let cid = enc(f[0]);
-                if user & HBIT != 0 {
-                    side.push((user, f[1]));
-                }
-                if cid & HBIT != 0 {
-                    side.push((cid, f[0]));
-                }
-                pmap.prefetch(user);
-                let slot = n % RING;
-                if n >= RING {
-                    let c = ring[slot];
-                    let key = pmap.key(c.key);
-                    out[pb(key)].push(Clk { key, ..c });
-                }
-                ring[slot] = Clk { key: user, cid, ts: (ts - cws) as u32, camp: cp };
-                n += 1;
-            });
-            for i in n.saturating_sub(RING)..n {
-                let c = ring[i % RING];
-                let key = pmap.key(c.key);
-                out[pb(key)].push(Clk { key, ..c });
+        || ((parts::<Ev>(np, ucap), Vec::new(), Vec::<u64>::new()), (parts::<Clk>(np, ccap), Vec::new())),
+        |((out, table, win), (cout, side)), item| {
+            if item < nd_parts {
+                let b = item;
+                    let segs: Vec<&[Raw]> = parsed.iter().map(|(p, _)| &p[b][..]).collect();
+                    let mut offs = Vec::with_capacity(segs.len() + 1);
+                    let mut n = 0usize;
+                    for s in &segs {
+                        offs.push(n);
+                        n += s.len();
+                    }
+                    offs.push(n);
+                    let get = |g: usize| -> &Raw {
+                        let mut t = 0;
+                        while g >= offs[t + 1] {
+                            t += 1;
+                        }
+                        &segs[t][g - offs[t]]
+                    };
+                    let size = (n * 2).next_power_of_two().max(16);
+                    let mask = size - 1;
+                    table.clear();
+                    table.resize(size, 0);
+                    // slot: (32-bit fingerprint << 32) | (index + 1); 0 = empty.
+                    // win: bitmap of the current winner of each event_id, so the output pass can read
+                    // records in order instead of hopping through the table.
+                    win.clear();
+                    win.resize(n / 64 + 1, 0);
+                    let mut g = 0usize;
+                    for s in &segs {
+                        for (ri, r) in s.iter().enumerate() {
+                            #[cfg(target_arch = "x86_64")]
+                            if ri + 16 < s.len() {
+                                unsafe {
+                                    use std::arch::x86_64::*;
+                                    let ph = (fmix(s[ri + 16].eid) as usize) & mask;
+                                    _mm_prefetch(table.as_ptr().add(ph) as *const i8, _MM_HINT_T0);
+                                }
+                            }
+                            let h = fmix(r.eid);
+                            let fp = (h >> 16) & 0xFFFF_FFFF;
+                            let mut pos = (h as usize) & mask;
+                            loop {
+                                let slot = table[pos];
+                                if slot == 0 {
+                                    table[pos] = (fp << 32) | (g as u64 + 1);
+                                    win[g >> 6] |= 1 << (g & 63);
+                                    break;
+                                }
+                                if slot >> 32 == fp {
+                                    let j = (slot & 0xFFFF_FFFF) as usize - 1;
+                                    let o = get(j);
+                                    if o.eid == r.eid {
+                                        if r.ingest < o.ingest {
+                                            table[pos] = (fp << 32) | (g as u64 + 1);
+                                            win[j >> 6] &= !(1 << (j & 63));
+                                            win[g >> 6] |= 1 << (g & 63);
+                                        }
+                                        break;
+                                    }
+                                }
+                                pos = (pos + 1) & mask;
+                            }
+                            g += 1;
+                        }
+                    }
+                    let mut g = 0usize;
+                    for s in &segs {
+                        for (ri, r) in s.iter().enumerate() {
+                            if ri + 16 < s.len() {
+                                pmap.prefetch(s[ri + 16].user);
+                            }
+                            if win[g >> 6] >> (g & 63) & 1 != 0 && m_typ(r.meta) != 0 {
+                                let key = pmap.key(r.user);
+                                out[pb(key)].push(Ev { key, meta: r.meta });
+                            }
+                            g += 1;
+                        }
+                    }
+            } else {
+                let ci = item - nd_parts;
+                let out = cout;
+                    // look persons up RING clicks after prefetching their slot
+                    let mut ring = [Clk { key: 0, cid: 0, ts: 0, camp: 0 }; RING];
+                    let mut n = 0usize;
+                    scan::<4>(cch[ci], |f| {
+                        if f[0].is_empty() || f[1].is_empty() {
+                            return;
+                        }
+                        let ts = match parse_ts(f[3]) {
+                            Some(t) if t >= cws && t < we => t,
+                            _ => return,
+                        };
+                        let cp = match camp.get(f[2]) {
+                            Some(c) => c,
+                            None => return,
+                        };
+                        let user = enc(f[1]);
+                        let cid = enc(f[0]);
+                        if user & HBIT != 0 {
+                            side.push((user, f[1]));
+                        }
+                        if cid & HBIT != 0 {
+                            side.push((cid, f[0]));
+                        }
+                        pmap.prefetch(user);
+                        let slot = n % RING;
+                        if n >= RING {
+                            let c = ring[slot];
+                            let key = pmap.key(c.key);
+                            out[pb(key)].push(Clk { key, ..c });
+                        }
+                        ring[slot] = Clk { key: user, cid, ts: (ts - cws) as u32, camp: cp };
+                        n += 1;
+                    });
+                    for i in n.saturating_sub(RING)..n {
+                        let c = ring[i % RING];
+                        let key = pmap.key(c.key);
+                        out[pb(key)].push(Clk { key, ..c });
+                    }
             }
         },
     );
-    log(t0, "clicks parsed");
+    let (survivors, cparsed): (Vec<_>, Vec<_>) = both.into_iter().unzip();
+    log(t0, "events deduped, clicks parsed");
 
     // hashed IDs: original text (for names and click_id tie-breaks)
     for (_, s) in &parsed {
@@ -1703,93 +1789,7 @@ fn main() {
         }
     }
     let side = &side;
-
-    // ---- dedup each partition: keep the copy with the smallest ingest_ts, then drop it if invalid
-    let ucap = est_lines / (threads * np) * 5 / 4 + 16;
-    let survivors: Vec<(Vec<Vec<Ev>>, Vec<u64>, Vec<u64>)> = run_par(
-        nd_parts,
-        threads,
-        || (parts::<Ev>(np, ucap), Vec::new(), Vec::<u64>::new()),
-        |(out, table, win), b| {
-            let segs: Vec<&[Raw]> = parsed.iter().map(|(p, _)| &p[b][..]).collect();
-            let mut offs = Vec::with_capacity(segs.len() + 1);
-            let mut n = 0usize;
-            for s in &segs {
-                offs.push(n);
-                n += s.len();
-            }
-            offs.push(n);
-            let get = |g: usize| -> &Raw {
-                let mut t = 0;
-                while g >= offs[t + 1] {
-                    t += 1;
-                }
-                &segs[t][g - offs[t]]
-            };
-            let size = (n * 2).next_power_of_two().max(16);
-            let mask = size - 1;
-            table.clear();
-            table.resize(size, 0);
-            // slot: (32-bit fingerprint << 32) | (index + 1); 0 = empty.
-            // win: bitmap of the current winner of each event_id, so the output pass can read
-            // records in order instead of hopping through the table.
-            win.clear();
-            win.resize(n / 64 + 1, 0);
-            let mut g = 0usize;
-            for s in &segs {
-                for (ri, r) in s.iter().enumerate() {
-                    #[cfg(target_arch = "x86_64")]
-                    if ri + 16 < s.len() {
-                        unsafe {
-                            use std::arch::x86_64::*;
-                            let ph = (fmix(s[ri + 16].eid) as usize) & mask;
-                            _mm_prefetch(table.as_ptr().add(ph) as *const i8, _MM_HINT_T0);
-                        }
-                    }
-                    let h = fmix(r.eid);
-                    let fp = (h >> 16) & 0xFFFF_FFFF;
-                    let mut pos = (h as usize) & mask;
-                    loop {
-                        let slot = table[pos];
-                        if slot == 0 {
-                            table[pos] = (fp << 32) | (g as u64 + 1);
-                            win[g >> 6] |= 1 << (g & 63);
-                            break;
-                        }
-                        if slot >> 32 == fp {
-                            let j = (slot & 0xFFFF_FFFF) as usize - 1;
-                            let o = get(j);
-                            if o.eid == r.eid {
-                                if r.ingest < o.ingest {
-                                    table[pos] = (fp << 32) | (g as u64 + 1);
-                                    win[j >> 6] &= !(1 << (j & 63));
-                                    win[g >> 6] |= 1 << (g & 63);
-                                }
-                                break;
-                            }
-                        }
-                        pos = (pos + 1) & mask;
-                    }
-                    g += 1;
-                }
-            }
-            let mut g = 0usize;
-            for s in &segs {
-                for (ri, r) in s.iter().enumerate() {
-                    if ri + 16 < s.len() {
-                        pmap.prefetch(s[ri + 16].user);
-                    }
-                    if win[g >> 6] >> (g & 63) & 1 != 0 && m_typ(r.meta) != 0 {
-                        let key = pmap.key(r.user);
-                        out[pb(key)].push(Ev { key, meta: r.meta });
-                    }
-                    g += 1;
-                }
-            }
-        },
-    );
     drop(parsed);
-    log(t0, "events deduped");
 
 
     // ---- per person bucket: sessions, user rows, credit and assists
