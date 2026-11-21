@@ -17,8 +17,6 @@ const WEEK: i64 = 7 * DAY;
 const LATE: i64 = DAY;
 const LINK_BIT: u64 = 1 << 63;
 const CHUNK: usize = 4 << 20;
-const DEDUP_BUCKETS: usize = 256;
-const PERSON_BUCKETS: usize = 512;
 const SHARDS: usize = 256;
 
 // ---------------------------------------------------------------- utilities
@@ -136,6 +134,7 @@ fn chunks(dir: &Path) -> Vec<S> {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn for_each_line(chunk: S, mut f: impl FnMut(S)) {
     let mut s = 0;
     for p in memchr_iter(b'\n', chunk) {
@@ -148,6 +147,7 @@ fn for_each_line(chunk: S, mut f: impl FnMut(S)) {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn unquote(f: S) -> Option<S> {
     if memchr(b'"', f).is_none() {
         return Some(f);
@@ -162,6 +162,7 @@ fn unquote(f: S) -> Option<S> {
 
 /// Split a line into exactly N fields per the CSV dialect. false = malformed.
 #[inline]
+#[allow(dead_code)]
 fn fields<const N: usize>(line: S, out: &mut [S; N]) -> bool {
     let quoted = memchr(b'"', line).is_some();
     let mut n = 0;
@@ -224,17 +225,19 @@ fn classify(block: &[u8; 64]) -> (u64, u64, u64) {
 }
 
 /// Call f with the N unquoted fields of every well-formed line in chunk (CSV dialect of rules.md).
+/// Walks only comma and newline bits; quotes are counted with popcount.
 #[inline(always)]
 fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
     let len = chunk.len();
-    let mut ends = [0usize; N]; // end offsets of fields 0..N-1 (commas)
+    let mut ends = [0usize; 8]; // end offsets of fields (commas); slot N.. absorbs extras
     let mut nc = 0usize; // commas seen in this line
-    let mut nq = 0u32; // quotes seen in this line
     let mut start = 0usize; // line start
+    let mut q_line = 0u32; // cumulative quote count at line start
+    let mut q_base = 0u32; // cumulative quote count at block start
     let mut out: [S; N] = [&[]; N];
     // A line is well formed when it has N fields and its only quotes are pairs wrapping whole
     // fields: then the quote count is exactly 2 per wrapped field.
-    let mut emit = |start: usize, end: usize, nc: usize, nq: u32, ends: &[usize; N]| {
+    let mut emit = |start: usize, end: usize, nc: usize, nq: u32, ends: &[usize; 8]| {
         if nc != N - 1 {
             return;
         }
@@ -265,30 +268,27 @@ fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
             &tmp
         };
         let (mn, mc, mq) = classify(block);
-        let mut m = mn | mc | mq;
+        let mut m = mn | mc;
         while m != 0 {
-            let i = m.trailing_zeros() as usize;
-            m &= m - 1;
-            let pos = base + i;
-            let bit = 1u64 << i;
+            let bit = m & m.wrapping_neg();
+            m ^= bit;
+            let pos = base + bit.trailing_zeros() as usize;
             if mc & bit != 0 {
-                if nc < N {
-                    ends[nc.min(N - 1)] = pos;
-                }
+                ends[nc.min(7)] = pos;
                 nc += 1;
-            } else if mn & bit != 0 {
-                emit(start, pos, nc, nq, &ends);
+            } else {
+                let q = q_base + (mq & (bit - 1)).count_ones();
+                emit(start, pos, nc, q - q_line, &ends);
+                q_line = q;
                 start = pos + 1;
                 nc = 0;
-                nq = 0;
-            } else {
-                nq += 1;
             }
         }
+        q_base += mq.count_ones();
         base += 64;
     }
     if start < len {
-        emit(start, len, nc, nq, &ends);
+        emit(start, len, nc, q_base - q_line, &ends);
     }
 }
 
@@ -334,6 +334,72 @@ fn dim(y: i64, m: i64) -> i64 {
     }
 }
 
+/// Days from 1970-01-01 to the first of (y, m), y >= 0.
+#[inline]
+fn month_start(y: i64, m: i64) -> i64 {
+    days_from_civil(y, m, 1)
+}
+
+/// F1 / F2: "YYYY-MM-DDTHH:MM:SS" then "Z" or "+HH:MM" / "-HH:MM".
+#[inline]
+fn parse_iso(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    let lo = u64::from_le_bytes(b[0..8].try_into().unwrap()); // YYYY-MM-
+    let hi = u64::from_le_bytes(b[8..16].try_into().unwrap()); // DDTHH:MM
+    // separators: lo bytes 4,7 = '-'; hi bytes 2 = 'T', 5 = ':'; b[16] = ':'
+    const LO_SEP: u64 = 0xFF00_00FF_0000_0000;
+    const HI_SEP: u64 = 0x0000_FF00_00FF_0000;
+    if lo & LO_SEP != 0x2D00_002D_0000_0000 || hi & HI_SEP != 0x0000_3A00_0054_0000 || b[16] != b':' {
+        return None;
+    }
+    // digits: every other byte must be '0'..'9'
+    let l = (lo & !LO_SEP) | (0x3030_3030_3030_3030 & LO_SEP);
+    let h = (hi & !HI_SEP) | (0x3030_3030_3030_3030 & HI_SEP);
+    let lt = l ^ 0x3030_3030_3030_3030;
+    let ht = h ^ 0x3030_3030_3030_3030;
+    if ((lt.wrapping_add(0x7676_7676_7676_7676) | lt) | (ht.wrapping_add(0x7676_7676_7676_7676) | ht)) & 0x8080_8080_8080_8080 != 0
+    {
+        return None;
+    }
+    let s1 = b[17].wrapping_sub(b'0');
+    let s2 = b[18].wrapping_sub(b'0');
+    if s1 > 9 || s2 > 9 {
+        return None;
+    }
+    let by = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as i64;
+    let y = by(lt, 0) * 1000 + by(lt, 1) * 100 + by(lt, 2) * 10 + by(lt, 3);
+    let mo = by(lt, 5) * 10 + by(lt, 6);
+    let d = by(ht, 0) * 10 + by(ht, 1);
+    let hh = by(ht, 3) * 10 + by(ht, 4);
+    let mi = by(ht, 6) * 10 + by(ht, 7);
+    let ss = s1 as i64 * 10 + s2 as i64;
+    if !(1..=12).contains(&mo) || d < 1 || d > dim(y, mo) || hh > 23 || mi > 59 || ss > 59 {
+        return None;
+    }
+    let mut secs = (month_start(y, mo) + d - 1) * 86400 + hh * 3600 + mi * 60 + ss;
+    if n == 20 {
+        if b[19] != b'Z' {
+            return None;
+        }
+    } else {
+        let sign = match b[19] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        let oh = d2(b, 20)?;
+        if b[22] != b':' {
+            return None;
+        }
+        let om = d2(b, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        secs -= sign * (oh * 3600 + om * 60);
+    }
+    Some(secs * 1000)
+}
+
 /// Parse an F1/F2/F3 timestamp to epoch ms. None = bad.
 #[inline]
 fn parse_ts(b: &[u8]) -> Option<i64> {
@@ -342,42 +408,19 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
         return None;
     }
     if (n == 20 || n == 25) && b[4] == b'-' {
-        let y = d2(b, 0)? * 100 + d2(b, 2)?;
-        if b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-            return None;
-        }
-        let mo = d2(b, 5)?;
-        let d = d2(b, 8)?;
-        let hh = d2(b, 11)?;
-        let mi = d2(b, 14)?;
-        let ss = d2(b, 17)?;
-        if !(1..=12).contains(&mo) || d < 1 || d > dim(y, mo) || hh > 23 || mi > 59 || ss > 59 {
-            return None;
-        }
-        let mut secs = days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss;
-        if n == 20 {
-            if b[19] != b'Z' {
-                return None;
-            }
-        } else {
-            let sign = match b[19] {
-                b'+' => 1,
-                b'-' => -1,
-                _ => return None,
-            };
-            let oh = d2(b, 20)?;
-            if b[22] != b':' {
-                return None;
-            }
-            let om = d2(b, 23)?;
-            if oh > 23 || om > 59 {
-                return None;
-            }
-            secs -= sign * (oh * 3600 + om * 60);
-        }
-        return Some(secs * 1000);
+        return parse_iso(b);
     }
     // F3: ASCII digits only
+    if n <= 18 {
+        let mut v: u64 = 0;
+        let mut bad = 0u8;
+        for &c in b {
+            let d = c.wrapping_sub(b'0');
+            bad |= (d > 9) as u8;
+            v = v * 10 + (d as u64 & 15);
+        }
+        return if bad == 0 { Some(v as i64) } else { None };
+    }
     let mut v: u64 = 0;
     for &c in b {
         let d = c.wrapping_sub(b'0');
@@ -476,6 +519,7 @@ struct People {
 impl People {
     /// Person key for a user ID: LINK_BIT | root for linked IDs, a hash of the ID otherwise.
     #[inline]
+    #[allow(dead_code)]
     fn key(&self, user: S) -> u64 {
         let p = pack(user);
         self.key_packed(p, phash(p))
@@ -637,6 +681,7 @@ fn run_par<T: Send>(
 fn parts<R>(n: usize, cap: usize) -> Vec<Vec<R>> {
     (0..n).map(|_| Vec::with_capacity(cap)).collect()
 }
+
 
 // ---------------------------------------------------------------- id maps
 
@@ -1045,6 +1090,7 @@ mod pq {
 }
 
 
+
 // ---------------------------------------------------------------- main
 
 fn main() {
@@ -1398,4 +1444,194 @@ fn main() {
     log(t0, "done");
     // skip destructors of large structures
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // reference: original an F1/F2/F3 timestamp to epoch ms. None = bad.
+    fn parse_ts_ref(b: &[u8]) -> Option<i64> {
+        let n = b.len();
+        if n == 0 {
+            return None;
+        }
+        if (n == 20 || n == 25) && b[4] == b'-' {
+            let y = d2(b, 0)? * 100 + d2(b, 2)?;
+            if b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+                return None;
+            }
+            let mo = d2(b, 5)?;
+            let d = d2(b, 8)?;
+            let hh = d2(b, 11)?;
+            let mi = d2(b, 14)?;
+            let ss = d2(b, 17)?;
+            if !(1..=12).contains(&mo) || d < 1 || d > dim(y, mo) || hh > 23 || mi > 59 || ss > 59 {
+                return None;
+            }
+            let mut secs = days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss;
+            if n == 20 {
+                if b[19] != b'Z' {
+                    return None;
+                }
+            } else {
+                let sign = match b[19] {
+                    b'+' => 1,
+                    b'-' => -1,
+                    _ => return None,
+                };
+                let oh = d2(b, 20)?;
+                if b[22] != b':' {
+                    return None;
+                }
+                let om = d2(b, 23)?;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                secs -= sign * (oh * 3600 + om * 60);
+            }
+            return Some(secs * 1000);
+        }
+        // F3: ASCII digits only
+        let mut v: u64 = 0;
+        for &c in b {
+            let d = c.wrapping_sub(b'0');
+            if d >= 10 {
+                return None;
+            }
+            v = v.checked_mul(10)?.checked_add(d as u64)?;
+        }
+        if v > i64::MAX as u64 {
+            return None;
+        }
+        Some(v as i64)
+    }
+    
+    
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick<'a>(&mut self, v: &'a [&'a [u8]]) -> &'a [u8] {
+            v[(self.next() % v.len() as u64) as usize]
+        }
+    }
+
+    fn mutate(r: &mut Rng, s: &[u8]) -> Vec<u8> {
+        let mut v = s.to_vec();
+        let alphabet: &[u8] = b"0123456789-:TZtz+ ,\"\r.e9x";
+        for _ in 0..(r.next() % 3) {
+            if v.is_empty() {
+                break;
+            }
+            let i = (r.next() % v.len() as u64) as usize;
+            match r.next() % 4 {
+                0 => v[i] = alphabet[(r.next() % alphabet.len() as u64) as usize],
+                1 => {
+                    v.remove(i);
+                }
+                2 => v.insert(i, alphabet[(r.next() % alphabet.len() as u64) as usize]),
+                _ => v[i] = v[i].wrapping_add(1),
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn timestamps_match_reference() {
+        let seeds: Vec<&[u8]> = vec![
+            b"2026-10-03T23:58:10Z", b"2026-10-03T19:58:10-04:00", b"1791071890000", b"0001791071890000",
+            b"2028-02-29T00:00:00Z", b"2027-02-29T00:00:00Z", b"2026-13-01T00:00:00Z", b"2026-10-03T24:00:00Z",
+            b"2026-10-03T23:59:60Z", b"2026-10-04T01:30:00+02:00", b"2026-10-04T01:30:00+24:00", b"2026-10-04T01:30:00+05:60",
+            b"2026-10-04T01:30:00+0200", b"2026-10-04T01:30:00-00:00", b"2026-10-04T01:30:00+23:59", b"86400000",
+            b"123456789012345678901", b"99999999999999999999", b"9223372036854775807", b"9223372036854775808",
+            b"2026-10-03 10:00:00Z", b"2026-10-03t10:00:00Z", b"2026-10-03T10:00:00z", b"2026-10-03T10:00:00.000Z",
+            b"0000-01-01T00:00:00Z", b"9999-12-31T23:59:59Z", b"1900-02-29T00:00:00Z", b"2000-02-29T00:00:00Z",
+            b"", b"-5", b"1.79e12", b"2026-1O-03T10:00:00Z", "２０26-10-03T10:00:00Z".as_bytes(), "١٧٩١٠٧١٨٩٠٠٠٠".as_bytes(),
+        ];
+        let mut r = Rng(0x9E3779B97F4A7C15);
+        for s in &seeds {
+            assert_eq!(parse_ts(s), parse_ts_ref(s), "{:?}", String::from_utf8_lossy(s));
+        }
+        for _ in 0..2_000_000 {
+            let seed = r.pick(&seeds);
+            let s = mutate(&mut r, seed);
+            assert_eq!(parse_ts(&s), parse_ts_ref(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+        // every timestamp in the dev data
+        for dir in ["data/dev/events", "data/dev/clicks"] {
+            for p in csv_files(Path::new(dir)) {
+                let data = std::fs::read(&p).unwrap();
+                for line in data.split(|&c| c == b'\n') {
+                    for f in line.split(|&c| c == b',') {
+                        let f = if f.len() >= 2 && f[0] == b'"' { &f[1..f.len() - 1] } else { f };
+                        assert_eq!(parse_ts(f), parse_ts_ref(f), "{:?}", String::from_utf8_lossy(f));
+                    }
+                }
+            }
+        }
+    }
+
+    fn scan_ref<const N: usize>(chunk: S) -> Vec<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        let mut f: [S; N] = [&[]; N];
+        for_each_line(chunk, |line| {
+            if fields(line, &mut f) {
+                v.push(f.iter().map(|x| x.to_vec()).collect());
+            }
+        });
+        v
+    }
+
+    fn scan_new<const N: usize>(chunk: S) -> Vec<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        scan::<N>(chunk, |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        v
+    }
+
+    #[test]
+    fn scanner_matches_reference() {
+        let leak = |v: Vec<u8>| -> S { Box::leak(v.into_boxed_slice()) };
+        // real data
+        for p in csv_files(Path::new("data/dev/events")) {
+            let d = leak(std::fs::read(&p).unwrap());
+            assert!(scan_new::<7>(d) == scan_ref::<7>(d), "{}", p.display());
+        }
+        for p in csv_files(Path::new("data/dev/links")) {
+            let d = leak(std::fs::read(&p).unwrap());
+            assert!(scan_new::<2>(d) == scan_ref::<2>(d), "{}", p.display());
+        }
+        // random mutated blocks of lines, with odd lengths and no trailing newline
+        let base = std::fs::read(csv_files(Path::new("data/dev/events"))[0].clone()).unwrap();
+        let lines: Vec<&[u8]> = base.split(|&c| c == b'\n').take(3000).collect();
+        let mut r = Rng(12345);
+        for round in 0..3000 {
+            let mut buf = Vec::new();
+            let n = (r.next() % 40) as usize;
+            for _ in 0..n {
+                let l: &[u8] = r.pick(&lines);
+                let l = if r.next() % 3 == 0 { mutate(&mut r, l) } else { l.to_vec() };
+                buf.extend_from_slice(&l);
+                if r.next() % 17 == 0 {
+                    buf.extend_from_slice(b"\"\"");
+                }
+                buf.push(b'\n');
+                if r.next() % 23 == 0 {
+                    buf.push(b'\n');
+                }
+            }
+            if round % 2 == 0 {
+                buf.pop();
+            }
+            let d = leak(buf);
+            assert!(scan_new::<7>(d) == scan_ref::<7>(d), "round {round}");
+            assert!(scan_new::<4>(d) == scan_ref::<4>(d), "round {round}");
+            assert!(scan_new::<2>(d) == scan_ref::<2>(d), "round {round}");
+        }
+    }
 }
