@@ -5,7 +5,6 @@ use hashbrown::HashTable;
 use memchr::{memchr, memchr_iter};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
@@ -281,6 +280,7 @@ fn d2(b: &[u8], i: usize) -> Option<i64> {
     }
 }
 
+#[cfg(test)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -292,10 +292,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 #[inline]
+#[cfg(test)]
 fn leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+#[cfg(test)]
 fn dim(y: i64, m: i64) -> i64 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -310,10 +312,35 @@ fn dim(y: i64, m: i64) -> i64 {
     }
 }
 
-/// Days from 1970-01-01 to the first of (y, m), y >= 0.
+const CUM_DAYS: [[i64; 13]; 2] = [
+    [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334],
+    [0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335],
+];
+const MONTH_DAYS: [[i64; 13]; 2] = [
+    [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+    [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+];
+
+/// Days from 1970-01-01 to (y, m, d), for 0 <= y <= 9999 and a valid date.
 #[inline]
-fn month_start(y: i64, m: i64) -> i64 {
-    days_from_civil(y, m, 1)
+fn days_ymd(y: i64, m: i64, d: i64, lp: usize) -> i64 {
+    let p = y - 1; // leap days before year y, counted from year 0 (year 0 is a leap year)
+    let leaps = if y > 0 { p / 4 - p / 100 + p / 400 + 1 } else { 0 };
+    y * 365 + leaps + CUM_DAYS[lp][m as usize] + d - 1 - 719_528
+}
+
+/// 8 ASCII digits (first digit in the lowest byte) to their value, or None.
+#[inline]
+fn digits8(x: u64) -> Option<u64> {
+    let t = x ^ 0x3030_3030_3030_3030;
+    if (t.wrapping_add(0x7676_7676_7676_7676) | t) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let v = t.wrapping_mul(10).wrapping_add(t >> 8);
+    let v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
+        >> 32;
+    Some(v)
 }
 
 /// F1 / F2: "YYYY-MM-DDTHH:MM:SS" then "Z" or "+HH:MM" / "-HH:MM".
@@ -322,13 +349,11 @@ fn parse_iso(b: &[u8]) -> Option<i64> {
     let n = b.len();
     let lo = u64::from_le_bytes(b[0..8].try_into().unwrap()); // YYYY-MM-
     let hi = u64::from_le_bytes(b[8..16].try_into().unwrap()); // DDTHH:MM
-    // separators: lo bytes 4,7 = '-'; hi bytes 2 = 'T', 5 = ':'; b[16] = ':'
     const LO_SEP: u64 = 0xFF00_00FF_0000_0000;
     const HI_SEP: u64 = 0x0000_FF00_00FF_0000;
     if lo & LO_SEP != 0x2D00_002D_0000_0000 || hi & HI_SEP != 0x0000_3A00_0054_0000 || b[16] != b':' {
         return None;
     }
-    // digits: every other byte must be '0'..'9'
     let l = (lo & !LO_SEP) | (0x3030_3030_3030_3030 & LO_SEP);
     let h = (hi & !HI_SEP) | (0x3030_3030_3030_3030 & HI_SEP);
     let lt = l ^ 0x3030_3030_3030_3030;
@@ -349,10 +374,11 @@ fn parse_iso(b: &[u8]) -> Option<i64> {
     let hh = by(ht, 3) * 10 + by(ht, 4);
     let mi = by(ht, 6) * 10 + by(ht, 7);
     let ss = s1 as i64 * 10 + s2 as i64;
-    if !(1..=12).contains(&mo) || d < 1 || d > dim(y, mo) || hh > 23 || mi > 59 || ss > 59 {
+    let lp = ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) as usize;
+    if !(1..=12).contains(&mo) || d < 1 || d > MONTH_DAYS[lp][mo as usize] || hh > 23 || mi > 59 || ss > 59 {
         return None;
     }
-    let mut secs = (month_start(y, mo) + d - 1) * 86400 + hh * 3600 + mi * 60 + ss;
+    let mut secs = days_ymd(y, mo, d, lp) * 86400 + hh * 3600 + mi * 60 + ss;
     if n == 20 {
         if b[19] != b'Z' {
             return None;
@@ -387,15 +413,12 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
         return parse_iso(b);
     }
     // F3: ASCII digits only
-    if n <= 18 {
-        let mut v: u64 = 0;
-        let mut bad = 0u8;
-        for &c in b {
-            let d = c.wrapping_sub(b'0');
-            bad |= (d > 9) as u8;
-            v = v * 10 + (d as u64 & 15);
-        }
-        return if bad == 0 { Some(v as i64) } else { None };
+    if n <= 16 {
+        let mut buf = [b'0'; 16];
+        buf[16 - n..].copy_from_slice(b);
+        let a = digits8(u64::from_le_bytes(buf[..8].try_into().unwrap()))?;
+        let c = digits8(u64::from_le_bytes(buf[8..].try_into().unwrap()))?;
+        return Some((a * 100_000_000 + c) as i64);
     }
     let mut v: u64 = 0;
     for &c in b {
@@ -551,6 +574,18 @@ fn dec(mut v: u64) -> Vec<u8> {
 
 /// Original text of hashed IDs.
 type Side = hashbrown::HashMap<u64, S>;
+
+#[inline]
+fn dec_into(mut v: u64, out: &mut Vec<u8>) {
+    for i in (0..12).rev() {
+        let d = (v / POW37[i]) as u8;
+        v %= POW37[i];
+        if d == 0 {
+            break;
+        }
+        out.push(if d <= 10 { b'0' + d - 1 } else { b'a' + d - 11 });
+    }
+}
 
 fn id_bytes(code: u64, side: &Side) -> Vec<u8> {
     if code & HBIT == 0 {
@@ -909,6 +944,9 @@ struct Scratch {
     touched: Vec<u16>,
     sess: Vec<Sess>,
     ct: Vec<(u32, i64)>,
+    ebuf: Vec<Ev>,
+    cbuf: Vec<Clk>,
+    cnt: Vec<usize>,
 }
 
 fn process_bucket(
@@ -920,9 +958,62 @@ fn process_bucket(
     acc: &mut Acc,
     sc: &mut Scratch,
 ) {
-    evs.sort_unstable_by_key(|e| (e.key, e.meta));
-    clks.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| cmp_ids(a.cid, b.cid, side)));
-    let Scratch { catsum, touched, sess, ct } = sc;
+    // Order both lists by (sub(key), key, time): one counting-sort pass on a hash of the key,
+    // then small in-cache sorts. Every person's records end up contiguous, in time order.
+    let k = ((evs.len() / 16).max(1).next_power_of_two().trailing_zeros()).clamp(2, 16);
+    let sub = |key: u64| -> usize { (fmix(key ^ 0x2545_f491_4f6c_dd1d) >> (64 - k)) as usize };
+    let nsub = 1usize << k;
+    let Scratch { catsum, touched, sess, ct, ebuf, cbuf, cnt } = sc;
+    cnt.clear();
+    cnt.resize(nsub + 1, 0);
+    for e in evs.iter() {
+        cnt[sub(e.key) + 1] += 1;
+    }
+    for i in 0..nsub {
+        cnt[i + 1] += cnt[i];
+    }
+    ebuf.clear();
+    ebuf.resize(evs.len(), Ev { key: 0, meta: 0 });
+    {
+        let mut pos = cnt.clone();
+        for e in evs.iter() {
+            let s = sub(e.key);
+            ebuf[pos[s]] = *e;
+            pos[s] += 1;
+        }
+    }
+    for i in 0..nsub {
+        let g = &mut ebuf[cnt[i]..cnt[i + 1]];
+        if g.len() > 1 {
+            g.sort_unstable_by_key(|e| (e.key, e.meta));
+        }
+    }
+    evs.copy_from_slice(ebuf);
+    if !clks.is_empty() {
+        cnt.iter_mut().for_each(|c| *c = 0);
+        for c in clks.iter() {
+            cnt[sub(c.key) + 1] += 1;
+        }
+        for i in 0..nsub {
+            cnt[i + 1] += cnt[i];
+        }
+        cbuf.clear();
+        cbuf.resize(clks.len(), Clk { key: 0, cid: 0, ts: 0, camp: 0 });
+        let mut pos = cnt.clone();
+        for c in clks.iter() {
+            let s = sub(c.key);
+            cbuf[pos[s]] = *c;
+            pos[s] += 1;
+        }
+        for i in 0..nsub {
+            let g = &mut cbuf[cnt[i]..cnt[i + 1]];
+            if g.len() > 1 {
+                g.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| cmp_ids(a.cid, b.cid, side)));
+            }
+        }
+        clks.copy_from_slice(cbuf);
+    }
+    let ord = |key: u64| (sub(key), key);
     let mut ci = 0usize;
     let mut i = 0usize;
     let nd = ctx.ndays;
@@ -1011,7 +1102,8 @@ fn process_bucket(
         flush(rows, cur_day, ds, de, dr, any_p, catsum, touched);
 
         // this person's clicks
-        while ci < clks.len() && clks[ci].key < key {
+        let okey = ord(key);
+        while ci < clks.len() && ord(clks[ci].key) < okey {
             ci += 1;
         }
         let mut cj = ci;
@@ -1089,55 +1181,235 @@ fn process_bucket(
 
 // ---------------------------------------------------------------- parquet
 
+/// Minimal Parquet writer for flat tables: one row group, one PLAIN-encoded uncompressed
+/// data page (v1) per column, Thrift compact footer.
 mod pq {
-    use super::*;
-    use parquet::basic::Compression;
-    use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-    use parquet::file::properties::{EnabledStatistics, WriterProperties};
-    use parquet::file::writer::SerializedFileWriter;
-    use parquet::schema::parser::parse_message_type;
+    pub const INT32: i32 = 1;
+    pub const INT64: i32 = 2;
+    pub const BYTE_ARRAY: i32 = 6;
+    pub const UTF8: i32 = 0; // converted types
+    pub const DATE: i32 = 6;
 
-    pub enum Col {
-        Str(Vec<ByteArray>, Option<Vec<i16>>),
-        I32(Vec<i32>),
-        I64(Vec<i64>),
+    pub struct Col {
+        pub name: &'static str,
+        pub ptype: i32,
+        pub conv: Option<i32>,
+        pub optional: bool,
+        pub data: Vec<u8>,
+        defs: Vec<u8>,
+        rows: usize,
     }
 
-    pub fn ba(s: S) -> ByteArray {
-        ByteArray::from(bytes::Bytes::from_static(s))
-    }
-
-    pub fn write(path: &Path, schema: &str, cols: Vec<Col>) {
-        let schema = Arc::new(parse_message_type(schema).unwrap());
-        let props = Arc::new(
-            WriterProperties::builder()
-                .set_compression(Compression::UNCOMPRESSED)
-                .set_dictionary_enabled(false)
-                .set_statistics_enabled(EnabledStatistics::None)
-                .set_max_row_group_size(usize::MAX)
-                .build(),
-        );
-        let file = std::fs::File::create(path).unwrap();
-        let file = std::io::BufWriter::with_capacity(1 << 20, file);
-        let mut w = SerializedFileWriter::new(file, schema, props).unwrap();
-        let mut rg = w.next_row_group().unwrap();
-        let mut it = cols.into_iter();
-        while let Some(mut col) = rg.next_column().unwrap() {
-            match it.next().unwrap() {
-                Col::Str(v, def) => {
-                    col.typed::<ByteArrayType>().write_batch(&v, def.as_deref(), None).unwrap();
-                }
-                Col::I32(v) => {
-                    col.typed::<Int32Type>().write_batch(&v, None, None).unwrap();
-                }
-                Col::I64(v) => {
-                    col.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
-                }
-            }
-            col.close().unwrap();
+    impl Col {
+        pub fn new(name: &'static str, ptype: i32, conv: Option<i32>, optional: bool, rows_hint: usize) -> Col {
+            let per = match ptype {
+                INT32 => 4,
+                INT64 => 8,
+                _ => 16,
+            };
+            Col { name, ptype, conv, optional, data: Vec::with_capacity(rows_hint * per), defs: Vec::new(), rows: 0 }
         }
-        rg.close().unwrap();
-        w.close().unwrap();
+        #[inline]
+        fn def(&mut self, present: bool) {
+            if self.rows % 8 == 0 {
+                self.defs.push(0);
+            }
+            if present {
+                *self.defs.last_mut().unwrap() |= 1 << (self.rows % 8);
+            }
+            self.rows += 1;
+        }
+        #[inline]
+        pub fn i32(&mut self, v: i32) {
+            self.data.extend_from_slice(&v.to_le_bytes());
+            self.rows += 1;
+        }
+        #[inline]
+        pub fn i64(&mut self, v: i64) {
+            self.data.extend_from_slice(&v.to_le_bytes());
+            self.rows += 1;
+        }
+        #[inline]
+        pub fn bytes(&mut self, s: &[u8]) {
+            self.data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            self.data.extend_from_slice(s);
+            if self.optional {
+                self.def(true);
+            } else {
+                self.rows += 1;
+            }
+        }
+        /// Append a string written by `f` into the value buffer (length patched afterwards).
+        #[inline]
+        pub fn bytes_with(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
+            let at = self.data.len();
+            self.data.extend_from_slice(&[0; 4]);
+            f(&mut self.data);
+            let n = (self.data.len() - at - 4) as u32;
+            self.data[at..at + 4].copy_from_slice(&n.to_le_bytes());
+            self.rows += 1;
+        }
+        #[inline]
+        pub fn null(&mut self) {
+            self.def(false);
+        }
+    }
+
+    struct T {
+        b: Vec<u8>,
+        last: Vec<i16>,
+    }
+
+    impl T {
+        fn varint(&mut self, mut v: u64) {
+            while v >= 0x80 {
+                self.b.push((v as u8) | 0x80);
+                v >>= 7;
+            }
+            self.b.push(v as u8);
+        }
+        fn field(&mut self, id: i16, ty: u8) {
+            let last = self.last.last_mut().unwrap();
+            let d = id - *last;
+            if d > 0 && d <= 15 {
+                self.b.push(((d as u8) << 4) | ty);
+            } else {
+                self.b.push(ty);
+                let z = ((id << 1) ^ (id >> 15)) as u16 as u64;
+                self.varint(z);
+            }
+            *self.last.last_mut().unwrap() = id;
+        }
+        fn i32f(&mut self, id: i16, v: i32) {
+            self.field(id, 5);
+            self.varint(((v << 1) ^ (v >> 31)) as u32 as u64);
+        }
+        fn i64f(&mut self, id: i16, v: i64) {
+            self.field(id, 6);
+            self.varint(((v << 1) ^ (v >> 63)) as u64);
+        }
+        fn binf(&mut self, id: i16, s: &[u8]) {
+            self.field(id, 8);
+            self.varint(s.len() as u64);
+            self.b.extend_from_slice(s);
+        }
+        fn struct_begin(&mut self, id: i16) {
+            self.field(id, 12);
+            self.last.push(0);
+        }
+        fn elem_begin(&mut self) {
+            self.last.push(0);
+        }
+        fn struct_end(&mut self) {
+            self.b.push(0);
+            self.last.pop();
+        }
+        fn list_begin(&mut self, id: i16, elem: u8, n: usize) {
+            self.field(id, 9);
+            if n < 15 {
+                self.b.push(((n as u8) << 4) | elem);
+            } else {
+                self.b.push(0xF0 | elem);
+                self.varint(n as u64);
+            }
+        }
+    }
+
+    pub fn write(path: &std::path::Path, cols: Vec<Col>) {
+        use std::io::Write;
+        let rows = cols.first().map(|c| c.rows).unwrap_or(0);
+        let mut out: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.data.len() + c.defs.len() + 64).sum::<usize>() + 4096);
+        out.extend_from_slice(b"PAR1");
+        let mut chunks: Vec<(i64, i64)> = Vec::new(); // (offset, size)
+        if rows > 0 {
+            for c in &cols {
+                assert_eq!(c.rows, rows, "column {} has {} rows, expected {}", c.name, c.rows, rows);
+                let mut body: Vec<u8> = Vec::new();
+                if c.optional {
+                    let mut lv = T { b: Vec::new(), last: vec![0] };
+                    lv.varint(((c.defs.len() as u64) << 1) | 1); // one bit-packed run
+                    lv.b.extend_from_slice(&c.defs);
+                    body.extend_from_slice(&(lv.b.len() as u32).to_le_bytes());
+                    body.extend_from_slice(&lv.b);
+                }
+                let size = body.len() + c.data.len();
+                let mut h = T { b: Vec::new(), last: vec![0] };
+                h.i32f(1, 0); // DATA_PAGE
+                h.i32f(2, size as i32);
+                h.i32f(3, size as i32);
+                h.struct_begin(5);
+                h.i32f(1, rows as i32);
+                h.i32f(2, 0); // PLAIN
+                h.i32f(3, 3); // RLE
+                h.i32f(4, 3); // RLE
+                h.struct_end();
+                h.b.push(0);
+                let off = out.len() as i64;
+                out.extend_from_slice(&h.b);
+                out.extend_from_slice(&body);
+                out.extend_from_slice(&c.data);
+                chunks.push((off, out.len() as i64 - off));
+            }
+        }
+        // footer: FileMetaData
+        let mut t = T { b: Vec::new(), last: vec![0] };
+        t.i32f(1, 1);
+        t.list_begin(2, 12, cols.len() + 1);
+        t.elem_begin();
+        t.binf(4, b"schema");
+        t.i32f(5, cols.len() as i32);
+        t.struct_end();
+        for c in &cols {
+            t.elem_begin();
+            t.i32f(1, c.ptype);
+            t.i32f(3, if c.optional { 1 } else { 0 });
+            t.binf(4, c.name.as_bytes());
+            if let Some(cv) = c.conv {
+                t.i32f(6, cv);
+                t.struct_begin(10);
+                t.struct_begin(if cv == DATE { 6 } else { 1 });
+                t.struct_end();
+                t.struct_end();
+            }
+            t.struct_end();
+        }
+        t.i64f(3, rows as i64);
+        if rows > 0 {
+            t.list_begin(4, 12, 1);
+            t.elem_begin();
+            t.list_begin(1, 12, cols.len());
+            for (c, &(off, size)) in cols.iter().zip(&chunks) {
+                t.elem_begin();
+                t.i64f(2, off);
+                t.struct_begin(3);
+                t.i32f(1, c.ptype);
+                t.list_begin(2, 5, 2);
+                t.varint(0); // PLAIN (zigzag 0)
+                t.varint(6); // RLE (zigzag 3)
+                t.list_begin(3, 8, 1);
+                t.varint(c.name.len() as u64);
+                t.b.extend_from_slice(c.name.as_bytes());
+                t.i32f(4, 0); // UNCOMPRESSED
+                t.i64f(5, rows as i64);
+                t.i64f(6, size);
+                t.i64f(7, size);
+                t.i64f(9, off);
+                t.struct_end();
+                t.struct_end();
+            }
+            t.i64f(2, chunks.iter().map(|c| c.1).sum());
+            t.i64f(3, rows as i64);
+            t.struct_end();
+        } else {
+            t.list_begin(4, 12, 0);
+        }
+        t.binf(6, b"shopping-sessions");
+        t.b.push(0);
+        out.extend_from_slice(&t.b);
+        out.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"PAR1");
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&out).unwrap();
     }
 }
 
@@ -1203,6 +1475,9 @@ fn main() {
 
     // ---- parse links, events and clicks
     let (pairs, mut side_list) = parse_links(&data_dir.join("links"), threads);
+    // the person table is only needed after dedup: build it while events are parsed
+    let link_side: Side = side_list.iter().copied().collect();
+    let people_thread = std::thread::spawn(move || build_people(pairs, &link_side, threads));
     log(t0, "links parsed");
 
     let ech = chunks(&data_dir.join("events"));
@@ -1224,11 +1499,17 @@ fn main() {
                 let eid = enc(f[0]);
                 let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
                 let mut r = Raw { eid, user: 0, ingest, meta: 0 };
-                let typ: u8 = match f[4] {
-                    b"view" => 1,
-                    b"cart" => 2,
-                    b"purchase" => 3,
-                    _ => 0,
+                let t = f[4];
+                let typ: u8 = if t.len() == 4 {
+                    match u32::from_le_bytes(t.try_into().unwrap()) {
+                        0x7765_6976 => 1, // "view"
+                        0x7472_6163 => 2, // "cart"
+                        _ => 0,
+                    }
+                } else if t.len() == 8 && u64::from_le_bytes(t.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
+                    3
+                } else {
+                    0
                 };
                 if typ != 0 && !f[1].is_empty() && !f[5].is_empty() {
                     if let Some(ts) = parse_ts(f[2]) {
@@ -1303,7 +1584,7 @@ fn main() {
     }
     let side = &side;
 
-    let people = build_people(pairs, side, threads);
+    let people = people_thread.join().unwrap();
     log(t0, "people built");
 
     // ---- dedup each partition: keep the copy with the smallest ingest_ts, then drop it if invalid
@@ -1414,7 +1695,7 @@ fn main() {
                 vec![[0i64; 4]; (ncamp + 1) * ndays],
                 Vec::new(),
                 Vec::new(),
-                Scratch { catsum: vec![0; ctx.ncat], touched: Vec::new(), sess: Vec::new(), ct: Vec::new() },
+                Scratch { catsum: vec![0; ctx.ncat], touched: Vec::new(), sess: Vec::new(), ct: Vec::new(), ebuf: Vec::new(), cbuf: Vec::new(), cnt: Vec::new() },
             )
         },
         |(rows, acc, evs, cl, sc), b| {
@@ -1445,12 +1726,6 @@ fn main() {
     let cd = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap();
     std::fs::create_dir_all(&cd).unwrap();
-    const USCHEMA: &str = "message user_daily { REQUIRED BYTE_ARRAY user_id (UTF8); REQUIRED INT32 day (DATE); \
-        REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; OPTIONAL BYTE_ARRAY top_category (UTF8); }";
-    const CSCHEMA: &str = "message campaign_daily { REQUIRED BYTE_ARRAY campaign_id (UTF8); REQUIRED BYTE_ARRAY channel (UTF8); \
-        REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions; REQUIRED INT64 revenue_cents; \
-        REQUIRED INT64 assisted_sessions; }";
-
     let catnames = &catnames;
     let camp_names = &camp_names;
     let acc = &acc;
@@ -1458,6 +1733,7 @@ fn main() {
     let cd = &cd;
     rayon::scope(|s| {
         s.spawn(move |_| {
+            use pq::*;
             let mut cr: Vec<(usize, usize, [i64; 4])> = Vec::new();
             for c in 0..=ncamp {
                 for d in 0..ndays {
@@ -1467,36 +1743,54 @@ fn main() {
                     }
                 }
             }
-            use pq::Col;
-            let cols = vec![
-                Col::Str(cr.iter().map(|r| pq::ba(camp_names[r.0].0)).collect(), None),
-                Col::Str(cr.iter().map(|r| pq::ba(camp_names[r.0].1)).collect(), None),
-                Col::I32(cr.iter().map(|r| (day0 + r.1 as i64) as i32).collect()),
-                Col::I64(cr.iter().map(|r| r.2[0]).collect()),
-                Col::I64(cr.iter().map(|r| r.2[1]).collect()),
-                Col::I64(cr.iter().map(|r| r.2[2]).collect()),
-                Col::I64(cr.iter().map(|r| r.2[3]).collect()),
+            let n = cr.len();
+            let mut cols = vec![
+                Col::new("campaign_id", BYTE_ARRAY, Some(UTF8), false, n),
+                Col::new("channel", BYTE_ARRAY, Some(UTF8), false, n),
+                Col::new("day", INT32, Some(DATE), false, n),
+                Col::new("sessions", INT64, None, false, n),
+                Col::new("purchasing_sessions", INT64, None, false, n),
+                Col::new("revenue_cents", INT64, None, false, n),
+                Col::new("assisted_sessions", INT64, None, false, n),
             ];
-            pq::write(&cd.join("part-00000.parquet"), CSCHEMA, cols);
+            for r in &cr {
+                cols[0].bytes(camp_names[r.0].0);
+                cols[1].bytes(camp_names[r.0].1);
+                cols[2].i32((day0 + r.1 as i64) as i32);
+                for k in 0..4 {
+                    cols[3 + k].i64(r.2[k]);
+                }
+            }
+            pq::write(&cd.join("part-00000.parquet"), cols);
         });
         for (fi, rs) in row_sets.iter().enumerate() {
             s.spawn(move |_| {
-                use pq::Col;
-                let cols = vec![
-                    Col::Str(
-                        rs.iter().map(|r| parquet::data_type::ByteArray::from(id_bytes(r.key, side))).collect(),
-                        None,
-                    ),
-                    Col::I32(rs.iter().map(|r| r.day).collect()),
-                    Col::I64(rs.iter().map(|r| r.sessions).collect()),
-                    Col::I64(rs.iter().map(|r| r.events).collect()),
-                    Col::I64(rs.iter().map(|r| r.revenue).collect()),
-                    Col::Str(
-                        rs.iter().filter_map(|r| r.top.map(|c| pq::ba(catnames[c as usize]))).collect(),
-                        Some(rs.iter().map(|r| r.top.is_some() as i16).collect()),
-                    ),
+                use pq::*;
+                let n = rs.len();
+                let mut cols = vec![
+                    Col::new("user_id", BYTE_ARRAY, Some(UTF8), false, n),
+                    Col::new("day", INT32, Some(DATE), false, n),
+                    Col::new("sessions", INT64, None, false, n),
+                    Col::new("events", INT64, None, false, n),
+                    Col::new("revenue_cents", INT64, None, false, n),
+                    Col::new("top_category", BYTE_ARRAY, Some(UTF8), true, n),
                 ];
-                pq::write(&ud.join(format!("part-{fi:05}.parquet")), USCHEMA, cols);
+                for r in rs {
+                    if r.key & HBIT == 0 {
+                        cols[0].bytes_with(|b| dec_into(r.key, b));
+                    } else {
+                        cols[0].bytes(side[&r.key]);
+                    }
+                    cols[1].i32(r.day);
+                    cols[2].i64(r.sessions);
+                    cols[3].i64(r.events);
+                    cols[4].i64(r.revenue);
+                    match r.top {
+                        Some(c) => cols[5].bytes(catnames[c as usize]),
+                        None => cols[5].null(),
+                    }
+                }
+                pq::write(&ud.join(format!("part-{fi:05}.parquet")), cols);
             });
         }
     });
