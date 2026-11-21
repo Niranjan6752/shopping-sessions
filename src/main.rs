@@ -1695,7 +1695,7 @@ fn main() {
     let ech = chunks(&data_dir.join("events"));
     let ebytes: usize = ech.iter().map(|c| c.len()).sum();
     let est_lines = ebytes / 70 + 1;
-    let dbits = ((est_lines / 160_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 11);
+    let dbits = ((est_lines / 320_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 10);
     let nd_parts = 1usize << dbits;
     let dshift = 64 - dbits;
     let cap = est_lines / (threads * nd_parts) * 5 / 4 + 16;
@@ -1728,7 +1728,8 @@ fn main() {
                         if ts >= ws && ts < we && ingest - ts <= LATE {
                             let price = if typ == 3 { parse_price(f[6]) } else { Some(0) };
                             if let Some(price) = price {
-                                let cat = prod.get(f[5]).unwrap_or(unknown);
+                                // the category only matters for purchases (top_category)
+                                let cat = if typ == 3 { prod.get(f[5]).unwrap_or(unknown) } else { 0 };
                                 r.meta = meta((ts - ws) as u32, typ, cat, price);
                                 r.user = enc(f[1]);
                                 if r.user & HBIT != 0 {
@@ -1747,7 +1748,7 @@ fn main() {
     let pmap = people_thread.join().unwrap();
     let pmap = &pmap;
     log(t0, "people built");
-    let pbits = ((est_lines / 60_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 12);
+    let pbits = ((est_lines / 320_000).max(1).next_power_of_two().trailing_zeros()).clamp(6, 10);
     let np = 1usize << pbits;
     let pshift = 64 - pbits;
     let pb = |key: u64| -> usize { (fmix(key ^ 0x5bd1e995) >> pshift) as usize };
