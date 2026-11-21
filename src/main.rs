@@ -1042,39 +1042,48 @@ struct Scratch {
     ebuf: Vec<Ev>,
     cbuf: Vec<Clk>,
     cnt: Vec<usize>,
+    dfirst: Vec<usize>,
 }
 
 fn process_bucket(
     ctx: &Ctx,
     side: &Side,
-    evs: &mut [Ev],
-    clks: &mut [Clk],
+    ev_parts: &[&[Ev]],
+    ck_parts: &[&[Clk]],
     rows: &mut Vec<UserRow>,
     acc: &mut Acc,
     sc: &mut Scratch,
 ) {
     // Order both lists by (sub(key), key, time): one counting-sort pass on a hash of the key,
-    // then small in-cache sorts. Every person's records end up contiguous, in time order.
-    let k = ((evs.len() / 16).max(1).next_power_of_two().trailing_zeros()).clamp(2, 16);
+    // straight from the partitions into the work buffer, then small in-cache sorts. Every
+    // person's records end up contiguous, in time order.
+    let n_ev: usize = ev_parts.iter().map(|p| p.len()).sum();
+    let n_ck: usize = ck_parts.iter().map(|p| p.len()).sum();
+    let k = ((n_ev / 16).max(1).next_power_of_two().trailing_zeros()).clamp(2, 16);
     let sub = |key: u64| -> usize { (fmix(key ^ 0x2545_f491_4f6c_dd1d) >> (64 - k)) as usize };
     let nsub = 1usize << k;
-    let Scratch { catsum, touched, sess, ct, ebuf, cbuf, cnt } = sc;
+    let Scratch { catsum, touched, sess, ct, ebuf, cbuf, cnt, dfirst } = sc;
     cnt.clear();
     cnt.resize(nsub + 1, 0);
-    for e in evs.iter() {
-        cnt[sub(e.key) + 1] += 1;
+    for p in ev_parts {
+        for e in p.iter() {
+            cnt[sub(e.key) + 1] += 1;
+        }
     }
     for i in 0..nsub {
         cnt[i + 1] += cnt[i];
     }
     ebuf.clear();
-    ebuf.resize(evs.len(), Ev { key: 0, meta: 0 });
+    ebuf.reserve(n_ev);
+    unsafe { ebuf.set_len(n_ev) };
     {
         let mut pos = cnt.clone();
-        for e in evs.iter() {
-            let s = sub(e.key);
-            ebuf[pos[s]] = *e;
-            pos[s] += 1;
+        for p in ev_parts {
+            for e in p.iter() {
+                let s = sub(e.key);
+                ebuf[pos[s]] = *e;
+                pos[s] += 1;
+            }
         }
     }
     for i in 0..nsub {
@@ -1083,22 +1092,26 @@ fn process_bucket(
             g.sort_unstable_by_key(|e| (e.key, e.meta));
         }
     }
-    evs.copy_from_slice(ebuf);
-    if !clks.is_empty() {
+    cbuf.clear();
+    if n_ck > 0 {
         cnt.iter_mut().for_each(|c| *c = 0);
-        for c in clks.iter() {
-            cnt[sub(c.key) + 1] += 1;
+        for p in ck_parts {
+            for c in p.iter() {
+                cnt[sub(c.key) + 1] += 1;
+            }
         }
         for i in 0..nsub {
             cnt[i + 1] += cnt[i];
         }
-        cbuf.clear();
-        cbuf.resize(clks.len(), Clk { key: 0, cid: 0, ts: 0, camp: 0 });
+        cbuf.reserve(n_ck);
+        unsafe { cbuf.set_len(n_ck) };
         let mut pos = cnt.clone();
-        for c in clks.iter() {
-            let s = sub(c.key);
-            cbuf[pos[s]] = *c;
-            pos[s] += 1;
+        for p in ck_parts {
+            for c in p.iter() {
+                let s = sub(c.key);
+                cbuf[pos[s]] = *c;
+                pos[s] += 1;
+            }
         }
         for i in 0..nsub {
             let g = &mut cbuf[cnt[i]..cnt[i + 1]];
@@ -1106,8 +1119,9 @@ fn process_bucket(
                 g.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)).then_with(|| cmp_ids(a.cid, b.cid, side)));
             }
         }
-        clks.copy_from_slice(cbuf);
     }
+    let evs: &[Ev] = ebuf;
+    let clks: &[Clk] = cbuf;
     let ord = |key: u64| (sub(key), key);
     let mut ci = 0usize;
     let mut i = 0usize;
@@ -1243,6 +1257,20 @@ fn process_bucket(
         ct.clear();
         ct.extend(c.iter().map(|x| (x.camp, ctx.cws + x.ts as i64)));
         ct.sort_unstable();
+        // for people with many sessions: dfirst[d] = index of their first session on day >= d,
+        // so an assist range is counted per day instead of per session
+        let many = sess.len() > 32;
+        if many {
+            dfirst.clear();
+            dfirst.resize(nd + 1, 0);
+            let mut i = 0;
+            for d in 0..=nd {
+                while i < sess.len() && sess[i].d < d {
+                    i += 1;
+                }
+                dfirst[d] = i;
+            }
+        }
         let mut x = 0;
         while x < ct.len() {
             let camp = ct[x].0;
@@ -1258,8 +1286,15 @@ fn process_bucket(
                 }
                 let lo = sess.partition_point(|s| s.start < a);
                 let hi = sess.partition_point(|s| s.start <= b);
-                for s in &sess[lo..hi] {
-                    acc[camp as usize * nd + s.d][3] += 1;
+                if many && lo < hi {
+                    for d in sess[lo].d..=sess[hi - 1].d {
+                        let n = hi.min(dfirst[d + 1]) - lo.max(dfirst[d]);
+                        acc[camp as usize * nd + d][3] += n as i64;
+                    }
+                } else {
+                    for s in &sess[lo..hi] {
+                        acc[camp as usize * nd + s.d][3] += 1;
+                    }
                 }
                 if more {
                     a = ct[x].1;
@@ -1793,7 +1828,7 @@ fn main() {
 
 
     // ---- per person bucket: sessions, user rows, credit and assists
-    let res: Vec<(Vec<UserRow>, Acc, Vec<Ev>, Vec<Clk>, Scratch)> = run_par(
+    let res: Vec<(Vec<UserRow>, Acc, Vec<&[Ev]>, Vec<&[Clk]>, Scratch)> = run_par(
         np,
         threads,
         || {
@@ -1802,23 +1837,21 @@ fn main() {
                 vec![[0i64; 4]; (ncamp + 1) * ndays],
                 Vec::new(),
                 Vec::new(),
-                Scratch { catsum: vec![0; ctx.ncat], touched: Vec::new(), sess: Vec::new(), ct: Vec::new(), ebuf: Vec::new(), cbuf: Vec::new(), cnt: Vec::new() },
+                Scratch { catsum: vec![0; ctx.ncat], touched: Vec::new(), sess: Vec::new(), ct: Vec::new(), ebuf: Vec::new(), cbuf: Vec::new(), cnt: Vec::new(), dfirst: Vec::new() },
             )
         },
-        |(rows, acc, evs, cl, sc), b| {
-            evs.clear();
-            cl.clear();
+        |(rows, acc, ev_parts, ck_parts, sc), b| {
+            ev_parts.clear();
+            ck_parts.clear();
             for (e, _, _) in &survivors {
-                evs.extend_from_slice(&e[b]);
+                ev_parts.push(&e[b][..]);
             }
             for (c, _) in &cparsed {
-                cl.extend_from_slice(&c[b]);
+                ck_parts.push(&c[b][..]);
             }
-            process_bucket(&ctx, side, evs, cl, rows, acc, sc);
+            process_bucket(&ctx, side, ev_parts, ck_parts, rows, acc, sc);
         },
     );
-    drop(survivors);
-    drop(cparsed);
     let mut acc = vec![[0i64; 4]; (ncamp + 1) * ndays];
     let mut row_sets: Vec<Vec<UserRow>> = Vec::new();
     for (r, a, _, _, _) in res {
@@ -1829,6 +1862,8 @@ fn main() {
             }
         }
     }
+    drop(survivors);
+    drop(cparsed);
     log(t0, &format!("sessions done: {} user rows", row_sets.iter().map(|r| r.len()).sum::<usize>()));
 
     // ---- write outputs
