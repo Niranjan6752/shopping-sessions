@@ -217,15 +217,22 @@ fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
             return;
         }
         let mut s = start;
+        if nq == 0 {
+            for k in 0..N {
+                let e = if k == N - 1 { end } else { ends[k] };
+                out[k] = &chunk[s..e];
+                s = e + 1;
+            }
+            f(&out);
+            return;
+        }
         let mut wrapped = 0u32;
         for k in 0..N {
             let e = if k == N - 1 { end } else { ends[k] };
-            let mut fld = &chunk[s..e];
-            if nq != 0 && fld.len() >= 2 && fld[0] == b'"' && fld[fld.len() - 1] == b'"' {
-                fld = &fld[1..fld.len() - 1];
-                wrapped += 2;
-            }
-            out[k] = fld;
+            // branch-free: w = 1 when the field is wrapped in quotes
+            let w = if e - s >= 2 { ((chunk[s] == b'"') & (chunk[e - 1] == b'"')) as usize } else { 0 };
+            out[k] = &chunk[s + w..e - w];
+            wrapped += 2 * w as u32;
             s = e + 1;
         }
         if wrapped == nq {
@@ -888,7 +895,7 @@ struct IdMap {
     fast: bool,
 }
 
-#[inline]
+#[inline(always)]
 fn canon_num(s: &[u8], prefix: &[u8]) -> Option<usize> {
     if s.len() <= prefix.len() || s.len() > prefix.len() + 7 {
         return None;
@@ -936,7 +943,7 @@ impl IdMap {
         };
         IdMap { prefix, arr, hash, fast }
     }
-    #[inline]
+    #[inline(always)]
     fn get(&self, s: &[u8]) -> Option<u32> {
         if self.fast {
             let n = canon_num(s, self.prefix)?;
